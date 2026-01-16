@@ -130,20 +130,23 @@ fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
 }
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-    const tokens = try tokenize("2 2 + 2 / p", allocator);
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
 
-    _ = execute(tokens, allocator) catch |err| {
-        switch (err) {
-            error.DivisionByZero => {
-                std.debug.print("Error: Division by zero\n", .{});
-            },
-            else => {
-                std.debug.print("Error: {any}\n", .{err});
-            },
-        }
-    };
+    if (args.len < 2) {
+        std.debug.print("Usage: {s} <input>\n", .{args[0]});
+        return error.NoInput;
+    }
+
+    const input = args[1];
+    const tokens = try tokenize(input, allocator);
+    const result = try execute(tokens, allocator);
+
+    _ = result;
 }
 
 test "2 + 2 = 4" {

@@ -87,7 +87,7 @@ pub fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
                 const b = stack.pop().?;
                 std.debug.assert(b == .number);
                 const res = a.number + b.number;
-                std.debug.print("add: {d} + {d} = {d}\n", .{ a.number, b.number, res });
+                std.debug.print("add: {d} + {d} = {d}\n", .{ b.number, a.number, res });
                 try stack.append(allocator, .{ .number = res });
             },
             .sub => {
@@ -97,7 +97,7 @@ pub fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
                 const b = stack.pop().?;
                 std.debug.assert(b == .number);
                 const res = b.number - a.number;
-                std.debug.print("sub: {d} - {d} = {d}\n", .{ a.number, b.number, res });
+                std.debug.print("sub: {d} - {d} = {d}\n", .{ b.number, a.number, res });
                 try stack.append(allocator, .{ .number = res });
             },
             .mul => {
@@ -107,7 +107,7 @@ pub fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
                 const b = stack.pop().?;
                 std.debug.assert(b == .number);
                 const res = a.number * b.number;
-                std.debug.print("mul: {d} * {d} = {d}\n", .{ a.number, b.number, res });
+                std.debug.print("mul: {d} * {d} = {d}\n", .{ b.number, a.number, res });
                 try stack.append(allocator, .{ .number = res });
             },
             .div => {

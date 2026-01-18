@@ -96,7 +96,7 @@ pub fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
                 std.debug.assert(a == .number);
                 const b = stack.pop().?;
                 std.debug.assert(b == .number);
-                const res = a.number - b.number;
+                const res = b.number - a.number;
                 std.debug.print("sub: {d} - {d} = {d}\n", .{ a.number, b.number, res });
                 try stack.append(allocator, .{ .number = res });
             },
@@ -120,7 +120,7 @@ pub fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
                     return error.DivisionByZero;
                 }
                 const res = b.number / a.number;
-                std.debug.print("div: {d} / {d} = {d}\n", .{ a.number, b.number, res });
+                std.debug.print("div: {d} / {d} = {d}\n", .{ b.number, a.number, res });
                 try stack.append(allocator, .{ .number = res });
             },
             .print => {
@@ -224,6 +224,13 @@ test "power of" {
     const tokens = try tokenize("2 3 ^", allocator);
     const result = try execute(tokens, allocator);
     try std.testing.expectEqual(@as(f64, 8), result[0].number);
+}
+
+test "1 - 5 = -4" {
+    const allocator = std.heap.page_allocator;
+    const tokens = try tokenize("1 5 -", allocator);
+    const result = try execute(tokens, allocator);
+    try std.testing.expectEqual(@as(f64, -4), result[0].number);
 }
 
 test "duplicate" {

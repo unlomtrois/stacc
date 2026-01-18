@@ -7,6 +7,8 @@ pub const Value = union(enum) {
     sub: void,
     mul: void,
     div: void,
+    pov: void,
+    dup: void,
     print: void,
 };
 
@@ -49,8 +51,14 @@ pub fn tokenize(src: []const u8, allocator: std.mem.Allocator) ![]Value {
             '/' => {
                 try tokens.append(allocator, .div);
             },
+            '^' => {
+                try tokens.append(allocator, .pov);
+            },
             'p' => {
                 try tokens.append(allocator, .print);
+            },
+            'd' => {
+                try tokens.append(allocator, .dup);
             },
             ' ' => {
                 continue;
@@ -123,6 +131,21 @@ pub fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
                     },
                 }
             },
+            .dup => {
+                std.debug.assert(stack.items.len >= 1);
+                const value = stack.pop().?;
+                try stack.append(allocator, value);
+                try stack.append(allocator, value);
+            },
+            .pov => {
+                std.debug.assert(stack.items.len >= 1);
+                const a = stack.pop().?;
+                std.debug.assert(a == .number);
+                const b = stack.pop().?;
+                std.debug.assert(b == .number);
+                const res = std.math.pow(u32, b.number, a.number);
+                try stack.append(allocator, .{ .number = res });
+            },
         }
     }
 
@@ -175,4 +198,18 @@ test "69 + 420 = 489" {
     const tokens = try tokenize("69 420 +", allocator);
     const result = try execute(tokens, allocator);
     try std.testing.expectEqual(@as(u32, 489), result[0].number);
+}
+
+test "power of" {
+    const allocator = std.heap.page_allocator;
+    const tokens = try tokenize("2 3 ^", allocator);
+    const result = try execute(tokens, allocator);
+    try std.testing.expectEqual(@as(u32, 8), result[0].number);
+}
+
+test "duplicate" {
+    const allocator = std.heap.page_allocator;
+    const tokens = try tokenize("2 d +", allocator);
+    const result = try execute(tokens, allocator);
+    try std.testing.expectEqual(@as(u32, 4), result[0].number);
 }

@@ -2,7 +2,7 @@
 const std = @import("std");
 
 pub const Value = union(enum) {
-    number: u32,
+    number: f64,
     add: void,
     sub: void,
     mul: void,
@@ -35,7 +35,7 @@ pub fn tokenize(src: []const u8, allocator: std.mem.Allocator) ![]Value {
         switch (char) {
             '0'...'9' => {
                 const len: usize = tokenizeNumber(src[i..]);
-                const number: u32 = try std.fmt.parseInt(u32, src[i .. i + len], 10);
+                const number: f64 = try std.fmt.parseFloat(f64, src[i .. i + len]);
                 i += len;
                 try tokens.append(allocator, .{ .number = number });
             },
@@ -87,6 +87,7 @@ pub fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
                 const b = stack.pop().?;
                 std.debug.assert(b == .number);
                 const res = a.number + b.number;
+                std.debug.print("add: {d} + {d} = {d}\n", .{ a.number, b.number, res });
                 try stack.append(allocator, .{ .number = res });
             },
             .sub => {
@@ -96,6 +97,7 @@ pub fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
                 const b = stack.pop().?;
                 std.debug.assert(b == .number);
                 const res = a.number - b.number;
+                std.debug.print("sub: {d} - {d} = {d}\n", .{ a.number, b.number, res });
                 try stack.append(allocator, .{ .number = res });
             },
             .mul => {
@@ -105,6 +107,7 @@ pub fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
                 const b = stack.pop().?;
                 std.debug.assert(b == .number);
                 const res = a.number * b.number;
+                std.debug.print("mul: {d} * {d} = {d}\n", .{ a.number, b.number, res });
                 try stack.append(allocator, .{ .number = res });
             },
             .div => {
@@ -116,7 +119,8 @@ pub fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
                 if (b.number == 0) {
                     return error.DivisionByZero;
                 }
-                const res = a.number / b.number;
+                const res = b.number / a.number;
+                std.debug.print("div: {d} / {d} = {d}\n", .{ a.number, b.number, res });
                 try stack.append(allocator, .{ .number = res });
             },
             .print => {
@@ -143,7 +147,8 @@ pub fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
                 std.debug.assert(a == .number);
                 const b = stack.pop().?;
                 std.debug.assert(b == .number);
-                const res = std.math.pow(u32, b.number, a.number);
+                const res = std.math.pow(f64, b.number, a.number);
+                std.debug.print("pov: {d} ^ {d} = {d}\n", .{ b.number, a.number, res });
                 try stack.append(allocator, .{ .number = res });
             },
         }
@@ -156,28 +161,42 @@ test "2 + 2 = 4" {
     const allocator = std.heap.page_allocator;
     const tokens = try tokenize("2 2 +", allocator);
     const result = try execute(tokens, allocator);
-    try std.testing.expect(result[0].number == 4);
+    try std.testing.expectEqual(@as(f64, 4), result[0].number);
 }
 
 test "(2 + 2) / 2 = 2" {
     const allocator = std.heap.page_allocator;
-    const tokens = try tokenize("2 2 2 + /", allocator);
+    const tokens = try tokenize("2 2 + 2 /", allocator);
     const result = try execute(tokens, allocator);
-    try std.testing.expect(result[0].number == 2);
+    try std.testing.expectEqual(@as(f64, 2), result[0].number);
+}
+
+test "16 / 8 = 2" {
+    const allocator = std.heap.page_allocator;
+    const tokens = try tokenize("16 8 /", allocator);
+    const result = try execute(tokens, allocator);
+    try std.testing.expectEqual(@as(f64, 2), result[0].number);
+}
+
+test "8 / 16 = 0.5" {
+    const allocator = std.heap.page_allocator;
+    const tokens = try tokenize("8 16 /", allocator);
+    const result = try execute(tokens, allocator);
+    try std.testing.expectEqual(@as(f64, 0.5), result[0].number);
 }
 
 test "2 * 2 + 2 = 6" {
     const allocator = std.heap.page_allocator;
     const tokens = try tokenize("2 2 * 2 +", allocator);
     const result = try execute(tokens, allocator);
-    try std.testing.expect(result[0].number == 6);
+    try std.testing.expectEqual(@as(f64, 6), result[0].number);
 }
 
 test "2 * (2 + 2) = 8" {
     const allocator = std.heap.page_allocator;
     const tokens = try tokenize("2 2 2 + *", allocator);
     const result = try execute(tokens, allocator);
-    try std.testing.expect(result[0].number == 8);
+    try std.testing.expectEqual(@as(f64, 8), result[0].number);
 }
 
 test "division by zero" {
@@ -190,26 +209,40 @@ test "division by zero" {
 test "tokenize number with multiple digits" {
     const allocator = std.heap.page_allocator;
     const tokens = try tokenize("69", allocator);
-    try std.testing.expect(tokens[0].number == 69);
+    try std.testing.expectEqual(@as(f64, 69), tokens[0].number);
 }
 
 test "69 + 420 = 489" {
     const allocator = std.heap.page_allocator;
     const tokens = try tokenize("69 420 +", allocator);
     const result = try execute(tokens, allocator);
-    try std.testing.expectEqual(@as(u32, 489), result[0].number);
+    try std.testing.expectEqual(@as(f64, 489), result[0].number);
 }
 
 test "power of" {
     const allocator = std.heap.page_allocator;
     const tokens = try tokenize("2 3 ^", allocator);
     const result = try execute(tokens, allocator);
-    try std.testing.expectEqual(@as(u32, 8), result[0].number);
+    try std.testing.expectEqual(@as(f64, 8), result[0].number);
 }
 
 test "duplicate" {
     const allocator = std.heap.page_allocator;
     const tokens = try tokenize("2 d +", allocator);
     const result = try execute(tokens, allocator);
-    try std.testing.expectEqual(@as(u32, 4), result[0].number);
+    try std.testing.expectEqual(@as(f64, 4), result[0].number);
+}
+
+test "(1 - 5) ^ 2" {
+    const allocator = std.heap.page_allocator;
+    const tokens = try tokenize("1 5 - 2 ^", allocator);
+    const result = try execute(tokens, allocator);
+    try std.testing.expectEqual(@as(f64, 16), result[0].number);
+}
+
+test "3 + 4 * 2 ÷ ( 1 - 5 ) ^ 2 = 3.5" {
+    const allocator = std.heap.page_allocator;
+    const tokens = try tokenize("3 4 2 * 1 5 - 2 ^ / +", allocator);
+    const result = try execute(tokens, allocator);
+    try std.testing.expectEqual(@as(f64, 3.5), result[0].number);
 }

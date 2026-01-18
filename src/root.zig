@@ -116,7 +116,8 @@ pub fn execute(tokens: []Value, allocator: std.mem.Allocator) ![]Value {
                 std.debug.assert(a == .number);
                 const b = stack.pop().?;
                 std.debug.assert(b == .number);
-                if (b.number == 0) {
+                if (a.number == 0) {
+                    std.debug.print("Division by zero: {d} / {d}\n", .{ b.number, a.number });
                     return error.DivisionByZero;
                 }
                 const res = b.number / a.number;
@@ -201,7 +202,7 @@ test "2 * (2 + 2) = 8" {
 
 test "division by zero" {
     const allocator = std.heap.page_allocator;
-    const tokens = try tokenize("2 2 - 2 /", allocator);
+    const tokens = try tokenize("2 2 2 - /", allocator);
     const result = execute(tokens, allocator);
     try std.testing.expectError(error.DivisionByZero, result);
 }

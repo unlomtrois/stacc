@@ -235,7 +235,8 @@ pub const Lexer = struct {
     }
 };
 
-fn testTokenize(src: []const u8, expected: []const Token.Tag) !void {
+/// Little helper for tests
+fn helper(src: []const u8, expected: []const Token.Tag) !void {
     var lexer = try Lexer.init(src);
 
     for (expected) |expected_tag| {
@@ -261,13 +262,13 @@ test "identifier" {
 test "key = value" {
     const src = "key = value";
 
-    try testTokenize(src, &[_]Token.Tag{ .identifier, .equal, .identifier });
+    try helper(src, &[_]Token.Tag{ .identifier, .equal, .identifier });
 }
 
 test "numbers" {
     const src = "key = 108";
 
-    try testTokenize(src, &[_]Token.Tag{ .identifier, .equal, .literal_number });
+    try helper(src, &[_]Token.Tag{ .identifier, .equal, .literal_number });
 }
 
 test "strings" {
@@ -275,7 +276,7 @@ test "strings" {
         \\ "test string"
     ;
 
-    try testTokenize(src, &.{
+    try helper(src, &.{
         .literal_string,
     });
 }
@@ -285,7 +286,7 @@ test "strings - not terminated" {
         \\ "not terminated string
     ;
 
-    try testTokenize(src, &.{
+    try helper(src, &.{
         .invalid,
     });
 }
@@ -296,7 +297,7 @@ test "booleans" {
         \\grok_is_false = false
     ;
 
-    try testTokenize(src, &[_]Token.Tag{
+    try helper(src, &[_]Token.Tag{
         .identifier,
         .equal,
         .literal_boolean,
@@ -313,7 +314,7 @@ test "blocks" {
         \\ }
     ;
 
-    try testTokenize(src, &[_]Token.Tag{
+    try helper(src, &[_]Token.Tag{
         .identifier,
         .equal,
         .l_brace,
@@ -332,7 +333,7 @@ test "greater less equal operators" {
         \\ age <= 18
     ;
 
-    try testTokenize(src, &[_]Token.Tag{
+    try helper(src, &[_]Token.Tag{
         .identifier, .greater_than,  .literal_number,
         .identifier, .less_than,     .literal_number,
         .identifier, .greater_equal, .literal_number,
@@ -348,7 +349,7 @@ test "different equal operators" {
         \\ this ?= c_france
     ;
 
-    try testTokenize(src, &[_]Token.Tag{
+    try helper(src, &[_]Token.Tag{
         .identifier, .equal,          .identifier,
         .identifier, .equal_equal,    .literal_number,
         .identifier, .not_equal,      .literal_number,
@@ -362,7 +363,7 @@ test "invalid tokens" {
         \\ something?
     ;
 
-    try testTokenize(src, &[_]Token.Tag{
+    try helper(src, &[_]Token.Tag{
         .identifier, .invalid,
         .identifier, .invalid,
     });
@@ -371,13 +372,13 @@ test "invalid tokens" {
 test "identifier can start from number" {
     const src = "8_something";
 
-    try testTokenize(src, &[_]Token.Tag{.identifier});
+    try helper(src, &[_]Token.Tag{.identifier});
 }
 
 test "UTF-8 BOM" {
     const src = UTF8_BOM_SEQUENCE ++ "key = value";
 
-    try testTokenize(src, &.{
+    try helper(src, &.{
         .identifier, .equal, .identifier,
     });
 }
@@ -432,11 +433,11 @@ test "skip comments" {
         \\ key = value
     ;
 
-    try testTokenize(src, &[_]Token.Tag{ .identifier, .equal, .identifier, .identifier, .equal, .identifier });
+    try helper(src, &[_]Token.Tag{ .identifier, .equal, .identifier, .identifier, .equal, .identifier });
 }
 
 test "& can be in identifiers" {
     const src = "ghw_region_finland_&_estonia = something";
 
-    try testTokenize(src, &[_]Token.Tag{ .identifier, .equal, .identifier });
+    try helper(src, &[_]Token.Tag{ .identifier, .equal, .identifier });
 }

@@ -79,6 +79,8 @@ pub const Lexer = struct {
             '}' => .r_brace,
             '[' => .l_bracket,
             ']' => .r_bracket,
+            '(' => .l_paren,
+            ')' => .r_paren,
 
             else => blk: {
                 if (isIdentifierScalar(c)) break :blk self.lexIdentifier();
@@ -251,9 +253,13 @@ fn helper(src: []const u8, expected: []const Token.Tag) !void {
 }
 
 test "2 + 2 = 4" {
-    const src = "2 + 2 = 4;";
+    const src = "2 + 2 = 4";
+    try helper(src, &[_]Token.Tag{ .literal_number, .plus, .literal_number, .equal, .literal_number });
+}
 
-    try helper(src, &[_]Token.Tag{ .literal_number, .plus, .literal_number, .equal, .literal_number, .semicolon });
+test "parens: (2 + 2) * 2 = 8" {
+    const src = "(2 + 2) * 2 = 8";
+    try helper(src, &[_]Token.Tag{ .l_paren, .literal_number, .plus, .literal_number, .r_paren, .multiply, .literal_number, .equal, .literal_number });
 }
 
 test "identifier" {

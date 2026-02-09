@@ -27,6 +27,8 @@ pub const Token = struct {
         r_brace, // }
         l_bracket, // [
         r_bracket, // ]
+        l_paren, // (
+        r_paren, // )
 
         // Arithmetic operators
         plus, // +

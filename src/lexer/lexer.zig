@@ -59,6 +59,7 @@ pub const Lexer = struct {
 
             // scope operators
             '.' => .dot,
+            ';' => .semicolon,
 
             // operators
             '=' => if (self.match('=')) .equal_equal else .equal,
@@ -247,6 +248,12 @@ fn helper(src: []const u8, expected: []const Token.Tag) !void {
     }
 
     try std.testing.expectEqual(Token.Tag.eof, lexer.next().?.tag);
+}
+
+test "2 + 2 = 4" {
+    const src = "2 + 2 = 4;";
+
+    try helper(src, &[_]Token.Tag{ .literal_number, .plus, .literal_number, .equal, .literal_number, .semicolon });
 }
 
 test "identifier" {

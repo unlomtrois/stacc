@@ -51,6 +51,7 @@ pub const Token = struct {
         // Scope resolution operators
         dot, // .
 
+        semicolon,
         comment, // # Something
         invalid,
         eof,

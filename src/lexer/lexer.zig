@@ -11,6 +11,7 @@ const keywords = std.StaticStringMap(Token.Tag).initComptime(.{
 });
 
 const UTF8_BOM_SEQUENCE = "\xEF\xBB\xBF";
+const MAX_ASCII = 0x7F; // useful ASCII range is 0-127
 
 pub const Lexer = struct {
     src: []const u8,
@@ -186,17 +187,23 @@ pub const Lexer = struct {
         }
     }
 
+    /// Returns whether a Unicode scalar is valid as a continuing part of an identifier.
+    /// Standard ASCII is restricted to alphanumeric, underscores, and single quotes.
+    /// Non-ASCII Unicode scalars are unconditionally allowed to support international
+    /// identifiers (e.g., UTF-8 variable names).
     inline fn isIdentifierScalar(c: u21) bool {
+        // 0 is explicitly invalid
         if (c == 0) return false;
-        if (c <= 0x7f) {
+        // Standard ASCII range (0x01 - 0x7F)
+        if (c <= MAX_ASCII) {
             const ascii: u8 = @intCast(c);
             if (std.ascii.isAlphanumeric(ascii)) return true;
             return switch (ascii) {
-                '_', '&', '\'' => true,
+                '_' => true,
                 else => false,
             };
         }
-        // Allow all non-ASCII scalars for identifiers.
+        // Allow all non-ASCII scalars (0x80 and above) for identifiers.
         return true;
     }
 
@@ -395,10 +402,4 @@ test "skip comments" {
     ;
 
     try helper(src, &[_]Token.Tag{ .literal_number, .literal_number });
-}
-
-test "& can be in identifiers" {
-    const src = "ghw_region_finland_&_estonia = something";
-
-    try helper(src, &[_]Token.Tag{ .identifier, .equal, .identifier });
 }

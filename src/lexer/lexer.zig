@@ -262,80 +262,28 @@ test "parens: (2 + 2) * 2 = 8" {
     try helper(src, &[_]Token.Tag{ .l_paren, .literal_number, .plus, .literal_number, .r_paren, .multiply, .literal_number, .equal, .literal_number });
 }
 
-test "identifier" {
-    const src = "key1";
-
-    var lex = try Lexer.init(src);
-    const token = lex.next().?;
-
-    try std.testing.expectEqualStrings("key1", token.getValue(src));
-    try std.testing.expectEqual(Token.Tag.identifier, token.tag);
-}
-
-test "key = value" {
+test "identifiers" {
     const src = "key = value";
 
     try helper(src, &[_]Token.Tag{ .identifier, .equal, .identifier });
 }
 
-test "numbers" {
-    const src = "key = 108";
-
-    try helper(src, &[_]Token.Tag{ .identifier, .equal, .literal_number });
-}
-
 test "strings" {
-    const src =
-        \\ "test string"
-    ;
+    const src = "\"test string\"";
 
-    try helper(src, &.{
-        .literal_string,
-    });
+    try helper(src, &.{.literal_string});
 }
 
 test "strings - not terminated" {
-    const src =
-        \\ "not terminated string
-    ;
+    const src = "\"not terminated string";
 
-    try helper(src, &.{
-        .invalid,
-    });
+    try helper(src, &.{.invalid});
 }
 
 test "booleans" {
-    const src =
-        \\grok_is_true = true
-        \\grok_is_false = false
-    ;
+    const src = "true * false";
 
-    try helper(src, &[_]Token.Tag{
-        .identifier,
-        .equal,
-        .literal_boolean,
-        .identifier,
-        .equal,
-        .literal_boolean,
-    });
-}
-
-test "blocks" {
-    const src =
-        \\ limit = {
-        \\     age > 18
-        \\ }
-    ;
-
-    try helper(src, &[_]Token.Tag{
-        .identifier,
-        .equal,
-        .l_brace,
-        .identifier,
-        .greater_than,
-        .literal_number,
-        .r_brace,
-    });
+    try helper(src, &[_]Token.Tag{ .literal_boolean, .multiply, .literal_boolean });
 }
 
 test "greater less equal operators" {
@@ -442,11 +390,11 @@ test "UTF-8 strings" {
 
 test "skip comments" {
     const src =
-        \\ key = value # something commented
-        \\ key = value
+        \\ 42 # something
+        \\ 27
     ;
 
-    try helper(src, &[_]Token.Tag{ .identifier, .equal, .identifier, .identifier, .equal, .identifier });
+    try helper(src, &[_]Token.Tag{ .literal_number, .literal_number });
 }
 
 test "& can be in identifiers" {

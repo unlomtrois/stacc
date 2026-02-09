@@ -1,8 +1,8 @@
 const std = @import("std");
-const stacc = @import("stacc");
+const stacc_vm = @import("stacc").vm;
 
-const tokenize = stacc.tokenize;
-const execute = stacc.execute;
+const tokenize = stacc_vm.tokenize;
+const execute = stacc_vm.execute;
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

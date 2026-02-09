@@ -69,3 +69,21 @@ pub fn tokenize(src: []const u8, allocator: std.mem.Allocator) ![]Value {
     }
     return tokens.toOwnedSlice(allocator);
 }
+
+fn helper(src: []const u8, expected: []const Value) !void {
+    const allocator = std.heap.page_allocator;
+    const tokens: []Value = try tokenize(src, allocator);
+    defer allocator.free(tokens);
+
+    for (tokens, 0..) |token, i| {
+        try std.testing.expectEqual(expected[i], token);
+    }
+}
+
+test "2 + 2 = 4" {
+    try helper("2 2 +", &[_]Value{
+        Value{ .number = 2 },
+        Value{ .number = 2 },
+        Value.add,
+    });
+}

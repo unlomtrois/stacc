@@ -6,8 +6,8 @@ const Token = @import("token.zig").Token;
 
 const keywords = std.StaticStringMap(Token.Tag).initComptime(.{
     // Boolean literals (special values, not identifiers)
-    .{ "yes", .literal_boolean },
-    .{ "no", .literal_boolean },
+    .{ "true", .literal_boolean },
+    .{ "false", .literal_boolean },
 });
 
 const UTF8_BOM_SEQUENCE = "\xEF\xBB\xBF";
@@ -59,13 +59,6 @@ pub const Lexer = struct {
 
             // scope operators
             '.' => .dot,
-            ':' => .colon,
-            '@' => .at,
-            '|' => .pipe,
-            '$' => .dollar,
-
-            // special
-            '%' => .percent,
 
             // operators
             '=' => if (self.match('=')) .equal_equal else .equal,
@@ -109,11 +102,11 @@ pub const Lexer = struct {
         const end = self.utf8_iter.i;
 
         // can be simded?
-        const is_potential_keyword: bool = switch (self.src[start]) {
-            'y', 'n' => blk: {
+        const is_potential_keyword: bool = switch (self.src[start]) { // slopy
+            't', 'f' => blk: {
                 const len = end - start;
-                if (len > 3) break :blk false;
-                break :blk true;
+                if (len >= 4) break :blk true;
+                break :blk false;
             },
             else => false,
         };
@@ -299,8 +292,8 @@ test "strings - not terminated" {
 
 test "booleans" {
     const src =
-        \\is_yes = yes
-        \\is_no = no
+        \\grok_is_true = true
+        \\grok_is_false = false
     ;
 
     try testTokenize(src, &[_]Token.Tag{
@@ -328,30 +321,6 @@ test "blocks" {
         .greater_than,
         .literal_number,
         .r_brace,
-    });
-}
-
-test "scope operators" {
-    const src =
-        \\ key1 = title:k_france.capital
-        \\ key2 = @some_var
-    ;
-
-    try testTokenize(src, &[_]Token.Tag{
-        // key1 = title:k_france.capital
-        .identifier,
-        .equal,
-        .identifier,
-        .colon,
-        .identifier,
-        .dot,
-        .identifier,
-
-        // key2 = @some_var
-        .identifier,
-        .equal,
-        .at,
-        .identifier,
     });
 }
 

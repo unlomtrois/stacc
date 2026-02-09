@@ -20,7 +20,7 @@ pub const Token = struct {
         // Literals
         literal_number, // 108
         literal_string, // "something.dds"
-        literal_boolean, // yes / no
+        literal_boolean, // true / false
 
         // Delimiters
         l_brace, // {
@@ -50,12 +50,6 @@ pub const Token = struct {
 
         // Scope resolution operators
         dot, // .
-        colon, // :
-        at, // @
-        pipe, // |
-        dollar, // $
-
-        percent, // %
 
         comment, // # Something
         invalid,

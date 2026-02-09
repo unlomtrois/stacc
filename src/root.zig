@@ -4,6 +4,12 @@ const std = @import("std");
 const tokenize = @import("tokenizer.zig").tokenize;
 const execute = @import("executor.zig").execute;
 
+test "lexer tests" {
+    comptime {
+        _ = @import("./lexer/lexer.zig");
+    }
+}
+
 test "2 + 2 = 4" {
     const allocator = std.heap.page_allocator;
     const tokens = try tokenize("2 2 +", allocator);

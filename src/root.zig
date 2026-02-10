@@ -3,14 +3,20 @@ const std = @import("std");
 
 pub const vm = @import("vm/vm.zig");
 
+test "old vm tests" {
+    comptime {
+        _ = @import("vm/vm.zig");
+    }
+}
+
 test "lexer tests" {
     comptime {
         _ = @import("./lexer/lexer.zig");
     }
 }
 
-test "old vm tests" {
+test "shunting yard" {
     comptime {
-        _ = @import("vm/vm.zig");
+        _ = @import("./parser/shunting_yard.zig");
     }
 }

@@ -37,6 +37,7 @@ pub const Token = struct {
         minus, // -
         multiply, // *
         divide, // /
+        caret,
 
         // Comparison operators
         greater_than, // >

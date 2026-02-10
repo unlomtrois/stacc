@@ -72,6 +72,7 @@ pub const Lexer = struct {
             '-' => .minus,
             '*' => .multiply,
             '/' => .divide,
+            '^' => .caret,
 
             // blocks
             '{' => .l_brace,

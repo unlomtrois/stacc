@@ -17,10 +17,12 @@ pub const Token = struct {
     pub const Tag = enum(u8) {
         identifier,
 
+        // Keywords
+        keyword_let,
+
         // Literals
         literal_number, // 108
         literal_string, // "something.dds"
-        literal_boolean, // true / false
 
         // Delimiters
         l_brace, // {

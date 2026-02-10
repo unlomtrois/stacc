@@ -5,9 +5,7 @@ const Utf8Iterator = std.unicode.Utf8Iterator;
 const Token = @import("token.zig").Token;
 
 const keywords = std.StaticStringMap(Token.Tag).initComptime(.{
-    // Boolean literals (special values, not identifiers)
-    .{ "true", .literal_boolean },
-    .{ "false", .literal_boolean },
+    .{ "let", .keyword_let },
 });
 
 const UTF8_BOM_SEQUENCE = "\xEF\xBB\xBF";
@@ -98,31 +96,14 @@ pub const Lexer = struct {
 
     fn lexIdentifier(self: *Lexer) Token.Tag {
         const start = self.utf8_iter.i - self.last_advance_len;
-
         while (self.peekScalar()) |scalar| {
             if (!isIdentifierScalar(scalar)) break;
             _ = self.advance();
         }
         const end = self.utf8_iter.i;
 
-        // can be simded?
-        const is_potential_keyword: bool = switch (self.src[start]) { // slopy
-            't', 'f' => blk: {
-                const len = end - start;
-                if (len >= 4) break :blk true;
-                break :blk false;
-            },
-            else => false,
-        };
-
-        if (is_potential_keyword) {
-            const content = self.src[start..end];
-            if (keywords.get(content)) |tag| {
-                return tag;
-            }
-        }
-
-        return .identifier;
+        const content = self.src[start..end];
+        return keywords.get(content) orelse .identifier;
     }
 
     fn lexNumber(self: *Lexer) Token.Tag {
@@ -270,27 +251,18 @@ test "parens: (2 + 2) * 2 = 8" {
 }
 
 test "identifiers" {
-    const src = "key = value";
-
-    try helper(src, &[_]Token.Tag{ .identifier, .equal, .identifier });
+    const src = "let key = 5";
+    try helper(src, &[_]Token.Tag{ .keyword_let, .identifier, .equal, .literal_number });
 }
 
 test "strings" {
-    const src = "\"test string\"";
-
-    try helper(src, &.{.literal_string});
+    const src = "let x = \"test string\"";
+    try helper(src, &.{ .keyword_let, .identifier, .equal, .literal_string });
 }
 
 test "strings - not terminated" {
     const src = "\"not terminated string";
-
     try helper(src, &.{.invalid});
-}
-
-test "booleans" {
-    const src = "true * false";
-
-    try helper(src, &[_]Token.Tag{ .literal_boolean, .multiply, .literal_boolean });
 }
 
 test "greater less equal operators" {
@@ -339,13 +311,11 @@ test "invalid tokens" {
 
 test "identifier can start from number" {
     const src = "8_something";
-
     try helper(src, &[_]Token.Tag{.identifier});
 }
 
 test "UTF-8 BOM" {
     const src = UTF8_BOM_SEQUENCE ++ "key = value";
-
     try helper(src, &.{
         .identifier, .equal, .identifier,
     });

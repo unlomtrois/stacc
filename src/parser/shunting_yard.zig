@@ -26,8 +26,10 @@ pub fn getPrecedence(tag: Token.Tag) u8 {
 }
 
 fn isLeftAssoc(tag: Token.Tag) bool {
-    return tag != .caret; // ^ is right-associative, everything else left
-    // return tag != .equal; // assignment is right-associative
+    return switch (tag) {
+        .caret => false, // ^ is right-associative, everything else left
+        else => true,
+    };
 }
 
 /// Lazy ShuntingYard

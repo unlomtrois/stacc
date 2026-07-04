@@ -25,7 +25,7 @@ pub fn getPrecedence(tag: Token.Tag) u8 {
     };
 }
 
-fn isLeftAssoc(tag: Token.Tag) bool {
+pub fn isLeftAssoc(tag: Token.Tag) bool {
     return switch (tag) {
         .caret => false, // ^ is right-associative, everything else left
         else => true,

@@ -58,6 +58,7 @@ pub const Lexer = struct {
 
             // scope operators
             '.' => .dot,
+            ':' => .colon,
             ';' => .semicolon,
 
             // operators
@@ -111,6 +112,20 @@ pub const Lexer = struct {
         while (self.peekAscii()) |ascii| {
             if (!std.ascii.isDigit(ascii)) break;
             _ = self.advance();
+        }
+
+        // fractional part: only consume '.' when a digit follows,
+        // so `5.foo` still lexes as number, dot, identifier
+        if (self.peekAscii()) |ascii| {
+            if (ascii == '.' and self.utf8_iter.i + 1 < self.src.len and
+                std.ascii.isDigit(self.src[self.utf8_iter.i + 1]))
+            {
+                _ = self.advance(); // '.'
+                while (self.peekAscii()) |digit| {
+                    if (!std.ascii.isDigit(digit)) break;
+                    _ = self.advance();
+                }
+            }
         }
 
         if (self.peekScalar()) |scalar| {
@@ -364,6 +379,26 @@ test "UTF-8 strings" {
     try std.testing.expectEqualStrings("\"Linnéa José\"", t.getValue(src));
 
     try std.testing.expectEqual(Token.Tag.eof, lexer.next().?.tag);
+}
+
+test "colon for type annotations" {
+    const src = "let x:i8 = 5;";
+    try helper(src, &[_]Token.Tag{ .keyword_let, .identifier, .colon, .identifier, .equal, .literal_number, .semicolon });
+}
+
+test "float literals" {
+    const src = "5.5 + 2";
+    try helper(src, &[_]Token.Tag{ .literal_number, .plus, .literal_number });
+
+    var lexer = try Lexer.init("1.25");
+    const t = lexer.next().?;
+    try std.testing.expectEqual(Token.Tag.literal_number, t.tag);
+    try std.testing.expectEqualStrings("1.25", t.getValue("1.25"));
+}
+
+test "dot after number without digit is not a float" {
+    const src = "5.foo";
+    try helper(src, &[_]Token.Tag{ .literal_number, .dot, .identifier });
 }
 
 test "skip comments" {

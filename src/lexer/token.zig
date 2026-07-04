@@ -55,6 +55,7 @@ pub const Token = struct {
 
         // Scope resolution operators
         dot, // .
+        colon, // : (type annotations)
 
         semicolon,
         comment, // # Something

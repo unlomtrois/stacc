@@ -1,12 +1,29 @@
-# fibonacci via while loop and assignment
-let n = 10;
-let a = 0;
-let b = 1;
-let i = 0;
-while (i < n) {
-    let t = a + b;
-    a = b;
-    b = t;
-    i = i + 1;
+# fibonacci as functions, benchmark-sized
+# run with: stacc run examples/fib.stacy
+
+# the classic benchmark: exponential recursion, ~1.6^n calls
+fn fib(n:i64):i64 {
+    if (n < 2) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
 }
-print(a);   # fib(10) = 55
+
+print(fib(40));       # 102334155, ~2^38 recursive calls
+
+# the largest fibonacci number that fits in i64 is fib(92);
+# computing it recursively would take centuries, so iterate
+fn fib_iter(n:i64):i64 {
+    let a = 0;
+    let b = 1;
+    let i = 0;
+    while (i < n) {
+        let t = a + b;
+        a = b;
+        b = t;
+        i = i + 1;
+    }
+    return a;
+}
+
+print(fib_iter(92));  # 7540113804746346429, i64 max is fib(92)

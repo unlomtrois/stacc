@@ -9,6 +9,8 @@ const keywords = std.StaticStringMap(Token.Tag).initComptime(.{
     .{ "if", .keyword_if },
     .{ "else", .keyword_else },
     .{ "while", .keyword_while },
+    .{ "fn", .keyword_fn },
+    .{ "return", .keyword_return },
 });
 
 const UTF8_BOM_SEQUENCE = "\xEF\xBB\xBF";
@@ -63,6 +65,7 @@ pub const Lexer = struct {
             '.' => .dot,
             ':' => .colon,
             ';' => .semicolon,
+            ',' => .comma,
 
             // operators
             '=' => if (self.match('=')) .equal_equal else .equal,
@@ -390,6 +393,18 @@ test "control flow keywords" {
         .keyword_if,    .l_paren, .identifier, .r_paren, .l_brace, .r_brace,
         .keyword_else,  .l_brace, .r_brace,
         .keyword_while, .l_paren, .identifier, .r_paren, .l_brace, .r_brace,
+    });
+}
+
+test "function keywords and comma" {
+    const src = "fn add(a:i64, b:i64):i64 { return a; }";
+    try helper(src, &[_]Token.Tag{
+        .keyword_fn,     .identifier, .l_paren,
+        .identifier,     .colon,      .identifier,
+        .comma,          .identifier, .colon,
+        .identifier,     .r_paren,    .colon,
+        .identifier,     .l_brace,    .keyword_return,
+        .identifier,     .semicolon,  .r_brace,
     });
 }
 

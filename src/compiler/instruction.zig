@@ -30,7 +30,32 @@ pub const Instruction = union(enum) {
     jump: usize,
     /// pop a bool; jump to the absolute index when it is false
     jump_if_false: usize,
+    /// allocate the top-level frame (always instruction 0, backpatched
+    /// with the final slot count at end of compilation)
+    enter: u32,
+    /// pop the arguments into a fresh frame and jump to the function body
+    call: Call,
+    /// drop the current frame and resume at the saved pc; a return value,
+    /// if any, stays on the value stack
+    ret,
+    /// falling off the end of a value-returning function
+    trap,
+    /// discard the top of the value stack (unused call result)
+    pop,
+    /// pop, coerce to the given type (range-checked), push
+    convert: Type,
     print,
+
+    pub const Call = struct {
+        /// callee name, kept only for disassembly
+        name: []const u8,
+        /// entry pc of the function body
+        target: usize,
+        num_params: u32,
+        /// full frame size (params + locals); backpatched for recursive
+        /// call sites emitted before the body finished compiling
+        num_slots: u32,
+    };
 
     pub const Load = struct {
         /// original variable name, kept only for disassembly
@@ -62,6 +87,12 @@ pub const Instruction = union(enum) {
             .load => |l| try writer.print("{s}.load {s}@{d}", .{ @tagName(l.type), l.name, l.slot }),
             .store => |s| try writer.print("{s}.store {s}@{d}", .{ @tagName(s.type), s.name, s.slot }),
             .print => try writer.writeAll("print"),
+            .enter => |n| try writer.print("enter {d}", .{n}),
+            .call => |c| try writer.print("call {s} -> {d} ({d} params, {d} slots)", .{ c.name, c.target, c.num_params, c.num_slots }),
+            .ret => try writer.writeAll("ret"),
+            .trap => try writer.writeAll("trap"),
+            .pop => try writer.writeAll("pop"),
+            .convert => |t| try writer.print("{s}.convert", .{@tagName(t)}),
             inline .jump, .jump_if_false => |target, op| {
                 if (target == unresolved) {
                     try writer.print("{s} -> ?", .{@tagName(op)});

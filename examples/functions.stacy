@@ -1,0 +1,29 @@
+# functions: parameters, return values, recursion
+fn add(a:i64, b:i64):i64 {
+    return a + b;
+}
+
+fn fact(n:i64):i64 {
+    if (n < 2) {
+        return 1;
+    }
+    return n * fact(n - 1);
+}
+
+fn fib(n:i64):i64 {
+    if (n < 2) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+# void function: no return type, called as a statement
+fn banner(x:i64) {
+    print(1000 + x);
+}
+
+banner(1);              # 1001
+print(add(40, 2));      # 42
+print(fact(10));        # 3628800
+print(fib(20));         # 6765
+print(add(fib(10), fact(5)) * 2);  # (55 + 120) * 2 = 350

@@ -5,39 +5,81 @@ const Value = value_mod.Value;
 const Type = value_mod.Type;
 const Instruction = @import("instruction.zig").Instruction;
 
+/// A call frame: where to resume, and where the caller's slots begin.
+const Frame = struct {
+    return_pc: usize,
+    slot_base: usize,
+};
+
+/// Backstop against runaway recursion.
+const max_call_depth = 1024;
+
 pub const Vm = struct {
     allocator: std.mem.Allocator,
     stack: std.ArrayList(Value),
-    slots: []Value,
+    /// all live frames' variable slots, contiguously; the current frame
+    /// starts at `slot_base`
+    slots: std.ArrayList(Value),
+    frames: std.ArrayList(Frame),
+    slot_base: usize,
     writer: *std.Io.Writer,
 
     pub fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer) Vm {
         return .{
             .allocator = allocator,
             .stack = .empty,
-            .slots = &.{},
+            .slots = .empty,
+            .frames = .empty,
+            .slot_base = 0,
             .writer = writer,
         };
     }
 
     pub fn deinit(self: *Vm) void {
         self.stack.deinit(self.allocator);
-        self.allocator.free(self.slots);
+        self.slots.deinit(self.allocator);
+        self.frames.deinit(self.allocator);
     }
 
     pub fn run(self: *Vm, program: []const Instruction) !void {
-        try self.allocateSlots(program);
-
         var pc: usize = 0;
         while (pc < program.len) {
             const inst = program[pc];
             pc += 1;
             switch (inst) {
                 .push_const => |v| try self.stack.append(self.allocator, v),
-                .load => |l| try self.stack.append(self.allocator, self.slots[l.slot]),
+                .load => |l| try self.stack.append(self.allocator, self.slots.items[self.slot_base + l.slot]),
                 .store => |s| {
                     const v = try (try self.pop()).coerce(s.type);
-                    self.slots[s.slot] = v;
+                    self.slots.items[self.slot_base + s.slot] = v;
+                },
+                .enter => |n| try self.slots.appendNTimes(self.allocator, .{ .i64 = 0 }, n),
+                .call => |c| {
+                    if (self.frames.items.len >= max_call_depth) return error.StackOverflow;
+                    const new_base = self.slots.items.len;
+                    try self.slots.appendNTimes(self.allocator, .{ .i64 = 0 }, c.num_slots);
+                    // arguments were pushed left to right; pop them into
+                    // the frame's leading slots in reverse
+                    var i: u32 = c.num_params;
+                    while (i > 0) {
+                        i -= 1;
+                        self.slots.items[new_base + i] = try self.pop();
+                    }
+                    try self.frames.append(self.allocator, .{ .return_pc = pc, .slot_base = self.slot_base });
+                    self.slot_base = new_base;
+                    pc = c.target;
+                },
+                .ret => {
+                    const frame = self.frames.pop() orelse return error.ReturnOutsideFunction;
+                    self.slots.shrinkRetainingCapacity(self.slot_base);
+                    self.slot_base = frame.slot_base;
+                    pc = frame.return_pc;
+                },
+                .trap => return error.MissingReturn,
+                .pop => _ = try self.pop(),
+                .convert => |t| {
+                    const v = try (try self.pop()).coerce(t);
+                    try self.stack.append(self.allocator, v);
                 },
                 inline .add, .sub, .mul, .div, .pow => |t, op| try self.binaryOp(@field(BinOp, @tagName(op)), t),
                 inline .eq, .ne, .lt, .gt, .le, .ge => |t, op| try self.comparisonOp(@field(CmpOp, @tagName(op)), t),
@@ -53,25 +95,6 @@ pub const Vm = struct {
                     try self.writer.writeByte('\n');
                 },
             }
-        }
-    }
-
-    /// One scan to size the flat slot array. The type checker guarantees
-    /// every load is preceded by its store, so slots start undefined-safe;
-    /// they are still zeroed defensively.
-    fn allocateSlots(self: *Vm, program: []const Instruction) !void {
-        var count: usize = 0;
-        for (program) |inst| {
-            switch (inst) {
-                .store => |s| count = @max(count, @as(usize, s.slot) + 1),
-                .load => |l| count = @max(count, @as(usize, l.slot) + 1),
-                else => {},
-            }
-        }
-        if (count > self.slots.len) {
-            self.allocator.free(self.slots);
-            self.slots = try self.allocator.alloc(Value, count);
-            @memset(self.slots, .{ .i64 = 0 });
         }
     }
 
@@ -180,6 +203,7 @@ test "arithmetic and print" {
 
 test "store and load roundtrip with annotation" {
     try runCapture(&.{
+        .{ .enter = 2 },
         .{ .push_const = .{ .i64 = 7 } },
         .{ .store = .{ .name = "x", .slot = 0, .type = .i8 } },
         .{ .load = .{ .name = "x", .slot = 0, .type = .i8 } },
@@ -199,6 +223,7 @@ test "overflow on typed store" {
     defer vm.deinit();
 
     try std.testing.expectError(error.Overflow, vm.run(&.{
+        .{ .enter = 1 },
         .{ .push_const = .{ .i64 = 300 } },
         .{ .store = .{ .name = "x", .slot = 0, .type = .i8 } },
     }));
@@ -278,6 +303,85 @@ test "arithmetic rejects mismatched runtime operand types" {
         .{ .push_const = .{ .f64 = 1.5 } },
         .{ .push_const = .{ .i64 = 1 } },
         .{ .add = .i64 },
+    }));
+}
+
+test "call passes args into frame slots and ret resumes" {
+    // fn double(x) { return x + x; }  at pc 1..4; main: call double(21), print
+    try runCapture(&.{
+        .{ .jump = 5 }, // skip over the body
+        .{ .load = .{ .name = "x", .slot = 0, .type = .i64 } }, // 1: body
+        .{ .load = .{ .name = "x", .slot = 0, .type = .i64 } },
+        .{ .add = .i64 },
+        .ret,
+        .{ .push_const = .{ .i64 = 21 } }, // 5: main
+        .{ .call = .{ .name = "double", .target = 1, .num_params = 1, .num_slots = 1 } },
+        .print,
+    }, "42\n");
+}
+
+test "frames isolate slots across calls" {
+    // main slot 0 = 7; callee writes its own slot 0; main's is untouched
+    try runCapture(&.{
+        .{ .enter = 1 },
+        .{ .jump = 5 },
+        .{ .push_const = .{ .i64 = 99 } }, // 2: body
+        .{ .store = .{ .name = "y", .slot = 0, .type = .i64 } },
+        .ret,
+        .{ .push_const = .{ .i64 = 7 } }, // 5: main
+        .{ .store = .{ .name = "x", .slot = 0, .type = .i64 } },
+        .{ .call = .{ .name = "f", .target = 2, .num_params = 0, .num_slots = 1 } },
+        .{ .load = .{ .name = "x", .slot = 0, .type = .i64 } },
+        .print,
+    }, "7\n");
+}
+
+test "trap reports a missing return" {
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    var vm = Vm.init(allocator, &aw.writer);
+    defer vm.deinit();
+
+    try std.testing.expectError(error.MissingReturn, vm.run(&.{.trap}));
+}
+
+test "pop discards and convert coerces" {
+    try runCapture(&.{
+        .{ .push_const = .{ .i64 = 1 } },
+        .pop,
+        .{ .push_const = .{ .i64 = 7 } },
+        .{ .convert = .f64 },
+        .print,
+    }, "7\n");
+}
+
+test "convert range-checks at runtime" {
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    var vm = Vm.init(allocator, &aw.writer);
+    defer vm.deinit();
+
+    try std.testing.expectError(error.Overflow, vm.run(&.{
+        .{ .push_const = .{ .i64 = 300 } },
+        .{ .convert = .i8 },
+    }));
+}
+
+test "call depth is bounded" {
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    var vm = Vm.init(allocator, &aw.writer);
+    defer vm.deinit();
+
+    // fn f() { f(); }  — infinite recursion
+    try std.testing.expectError(error.StackOverflow, vm.run(&.{
+        .{ .jump = 3 },
+        .{ .call = .{ .name = "f", .target = 1, .num_params = 0, .num_slots = 0 } }, // 1: body
+        .ret,
+        .{ .call = .{ .name = "f", .target = 1, .num_params = 0, .num_slots = 0 } }, // 3: main
     }));
 }
 

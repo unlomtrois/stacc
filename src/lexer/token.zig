@@ -22,6 +22,8 @@ pub const Token = struct {
         keyword_if,
         keyword_else,
         keyword_while,
+        keyword_fn,
+        keyword_return,
 
         // Literals
         literal_number, // 108
@@ -61,6 +63,7 @@ pub const Token = struct {
         colon, // : (type annotations)
 
         semicolon,
+        comma, // , (argument separator)
         comment, // # Something
         invalid,
         eof,

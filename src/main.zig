@@ -6,10 +6,11 @@ const usage_text =
     \\stacc - the Stacy compiler
     \\
     \\Usage:
-    \\  stacc run <file.stacy>                interpret a program
+    \\  stacc run <file.stacy>                compile and run a program
     \\  stacc compile <file.stacy> [-o out]   compile to a native executable
     \\
     \\Options:
+    \\  --interpret  run on the bytecode VM instead of compiling (run only)
     \\  --verbose    trace type checking and show the compiled bytecode
     \\  --emit-asm   keep the generated .s and .runtime.c (compile only)
     \\
@@ -36,6 +37,7 @@ pub fn main(init: std.process.Init) !void {
 
     var verbose = false;
     var emit_asm = false;
+    var interpret = false;
     var out_name: ?[]const u8 = null;
     var file_path: ?[]const u8 = null;
     var arg_index: usize = 2;
@@ -43,6 +45,8 @@ pub fn main(init: std.process.Init) !void {
         const arg = args[arg_index];
         if (std.mem.eql(u8, arg, "--verbose")) {
             verbose = true;
+        } else if (std.mem.eql(u8, arg, "--interpret") and command == .run) {
+            interpret = true;
         } else if (std.mem.eql(u8, arg, "--emit-asm") and command == .compile) {
             emit_asm = true;
         } else if (std.mem.eql(u8, arg, "-o") and command == .compile) {
@@ -77,12 +81,33 @@ pub fn main(init: std.process.Init) !void {
     }
 
     switch (command) {
-        .run => try run(allocator, io, program),
+        .run => if (interpret) {
+            try runInterpreted(allocator, io, program);
+        } else {
+            try runNative(allocator, io, program, stem(path));
+        },
         .compile => try compileNative(allocator, io, program, out_name orelse stem(path), emit_asm),
     }
 }
 
-fn run(allocator: std.mem.Allocator, io: Io, program: []const stacc.compiler.Instruction) !void {
+/// go-run style: compile to a temporary executable, execute it, clean
+/// up, and propagate the program's exit code.
+fn runNative(allocator: std.mem.Allocator, io: Io, program: []const stacc.compiler.Instruction, name: []const u8) !void {
+    const out = try std.fmt.allocPrint(allocator, "/tmp/stacc-run-{d}-{s}", .{ std.os.linux.getpid(), name });
+    try compileNative(allocator, io, program, out, false);
+
+    const argv = [_][]const u8{out};
+    var child = try std.process.spawn(io, .{ .argv = &argv });
+    const term = child.wait(io);
+    Io.Dir.deleteFileAbsolute(io, out) catch {};
+
+    switch (try term) {
+        .exited => |code| if (code != 0) std.process.exit(code),
+        else => std.process.exit(1),
+    }
+}
+
+fn runInterpreted(allocator: std.mem.Allocator, io: Io, program: []const stacc.compiler.Instruction) !void {
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const writer = &stdout_writer.interface;

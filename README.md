@@ -79,7 +79,8 @@ Requires Zig master (0.17-dev).
 
 ```sh
 zig build test                                    # run the test suite
-zig build run -- run examples/functions.stacy     # interpret a program
+zig build run -- run examples/functions.stacy     # compile & run (go-run style)
+zig build run -- run --interpret examples/fib.stacy   # run on the bytecode VM
 zig build run -- run --verbose examples/fib.stacy
 zig build run -- compile examples/fib.stacy -o fib   # compile to a native executable
 ./fib

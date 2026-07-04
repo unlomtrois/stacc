@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 - Build: `zig build`
-- Run a program: `zig build run -- run examples/basic.stacy`
+- Run a program: `zig build run -- run examples/basic.stacy` (go-run style: compiles natively to a temp executable and runs it; add `--interpret` to use the bytecode VM instead)
 - Compile to native: `zig build run -- compile examples/fib.stacy [-o out] [--emit-asm]` (silent; lowers to `.s`, invokes `zig cc`, removes intermediates unless `--emit-asm`)
 - `--verbose` (both subcommands) traces type checking and dumps the bytecode to stderr
 - Run all tests: `zig build test`

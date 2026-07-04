@@ -20,6 +20,19 @@ pub const IntrinsicMethod = struct {
     intrinsic: Intrinsic,
 };
 
+/// VM-side implementation of an `extern fn`. Arguments arrive as raw
+/// stack slots in declaration order; the handler fills `results` and
+/// returns how many slots it produced (must match the declared return
+/// width). Handlers are infallible: failures are reported through
+/// values (e.g. a negative fd), keeping both engines' behavior
+/// identical.
+pub const ExternHandler = *const fn (args: []const value.Value, results: *[2]value.Value) u32;
+
+pub const VmExtern = struct {
+    symbol: []const u8,
+    handler: ExternHandler,
+};
+
 pub const Module = struct {
     name: []const u8,
     /// a type name this module makes resolvable
@@ -27,4 +40,11 @@ pub const Module = struct {
     /// whether string literals require this module
     provides_string_literals: bool = false,
     intrinsics: []const IntrinsicMethod = &.{},
+    /// rung 2/3: Stacy source spliced into the token stream at `use`
+    stacy_source: ?[]const u8 = null,
+    /// rung 3: C source providing the module's extern symbols, linked
+    /// into native executables that use the module
+    native_impl: ?[]const u8 = null,
+    /// rung 3: the same extern symbols for the VM
+    vm_externs: []const VmExtern = &.{},
 };

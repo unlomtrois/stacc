@@ -1,0 +1,7 @@
+# uses the project-local module in modules/geometry.stacy (rung 2):
+# stacc resolves `use geometry;` to that file and splices it in.
+use geometry;
+
+let p:Point = (3, 0 - 4);
+print(p.manhattan());        # 7
+print(dot(p, (2, 10)));      # 3*2 + -4*10 = -34

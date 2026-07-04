@@ -13,6 +13,7 @@ const keywords = std.StaticStringMap(Token.Tag).initComptime(.{
     .{ "return", .keyword_return },
     .{ "use", .keyword_use },
     .{ "type", .keyword_type },
+    .{ "extern", .keyword_extern },
 });
 
 const UTF8_BOM_SEQUENCE = "\xEF\xBB\xBF";

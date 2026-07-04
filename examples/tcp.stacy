@@ -1,0 +1,17 @@
+# the net module: TCP client sockets (rung 3: Stacy surface, native
+# machinery). Because externs only exist inside modules, a program
+# without `use net;` provably cannot open a socket.
+#
+# run a listener first, e.g.:   ncat -l 127.0.0.1 8000 --exec /bin/cat
+use net;
+
+let s = net_connect("127.0.0.1", 8000);
+print(s.ok());
+
+if (s.ok()) {
+    print(s.send("hello from stacy"));
+    let reply = net_recv(s.fd);
+    print(reply.len());
+    print(reply);
+    print(s.close());
+}

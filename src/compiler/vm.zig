@@ -4,6 +4,7 @@ const value_mod = @import("value.zig");
 const Value = value_mod.Value;
 const Type = value_mod.Type;
 const Instruction = @import("instruction.zig").Instruction;
+const modules = @import("../modules/registry.zig");
 
 /// A call frame: where to resume, and where the caller's slots begin.
 const Frame = struct {
@@ -114,6 +115,23 @@ pub const Vm = struct {
                     self.slots.shrinkRetainingCapacity(self.slot_base);
                     self.slot_base = frame.slot_base;
                     pc = frame.return_pc;
+                },
+                .call_extern => |e| {
+                    var args: [8]Value = undefined;
+                    if (e.num_params > args.len) return error.ArgumentCountMismatch;
+                    var i: u32 = e.num_params;
+                    while (i > 0) {
+                        i -= 1;
+                        args[i] = try self.pop();
+                    }
+                    const handler = modules.findExtern(e.symbol) orelse return error.UnknownExtern;
+                    var results: [2]Value = undefined;
+                    const produced = handler(args[0..e.num_params], &results);
+                    if (produced != e.returns_width) return error.TypeMismatch;
+                    var k: u32 = 0;
+                    while (k < produced) : (k += 1) {
+                        try self.stack.append(self.allocator, results[k]);
+                    }
                 },
                 .trap => return error.MissingReturn,
                 .pop => _ = try self.pop(),

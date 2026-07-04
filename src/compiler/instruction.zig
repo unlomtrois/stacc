@@ -53,6 +53,10 @@ pub const Instruction = union(enum) {
     convert_under: Type,
     /// pop and print a value of the statically known type
     print: Type,
+    /// call an extern symbol (module-provided native/VM code): pops
+    /// num_params slots into the SysV argument registers, pushes
+    /// returns_width result slots
+    call_extern: Extern,
     /// push a str: pointer to the bytes, then the length (2 slots).
     /// The slice points into the source buffer; native codegen copies
     /// the bytes into .rodata.
@@ -74,6 +78,14 @@ pub const Instruction = union(enum) {
         num_params: u32,
         num_slots: u32,
         returns_value: bool,
+    };
+
+    pub const Extern = struct {
+        symbol: []const u8,
+        /// argument slots (a str argument is two)
+        num_params: u32,
+        /// result slots: 0 (void), 1 (scalar/one-slot struct) or 2 (str)
+        returns_width: u32,
     };
 
     pub const Call = struct {
@@ -143,6 +155,7 @@ pub const Instruction = union(enum) {
                 }
             },
             .ret => |has_value| try writer.writeAll(if (has_value) "ret value" else "ret"),
+            .call_extern => |e| try writer.print("extern {s} ({d} slots -> {d})", .{ e.symbol, e.num_params, e.returns_width }),
             .trap => try writer.writeAll("trap"),
             .pop => try writer.writeAll("pop"),
             .convert => |t| try writer.print("{s}.convert", .{@tagName(t)}),

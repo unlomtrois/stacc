@@ -213,6 +213,10 @@ fn analyze(allocator: std.mem.Allocator, program: []const Instruction) !Plan {
                 depth -= c.num_params;
                 if (c.returns_value) depth += 1;
             },
+            .call_extern => |e| {
+                depth -= e.num_params;
+                depth += e.returns_width;
+            },
             .jump => |target| {
                 if (target < index) try builder.back_edges.append(allocator, .{ target, index });
                 depth = 0; // whatever follows is only reachable via a label
@@ -1026,6 +1030,29 @@ const Emitter = struct {
                     }
                 } else if (c.returns_value) {
                     try w.writeAll("    pushq %rax\n");
+                }
+            },
+            .call_extern => |e| {
+                // marshal argument slots into the SysV registers; the
+                // compiler guarantees num_params <= 6 and no floats
+                const arg_regs = [_][]const u8{ "%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9" };
+                if (reg_mode) try self.flush();
+                var k: u32 = e.num_params;
+                while (k > 0) {
+                    k -= 1;
+                    try w.print("    popq {s}\n", .{arg_regs[k]});
+                }
+                try self.emitHelperCall(e.symbol);
+                if (reg_mode) {
+                    self.depth -= e.num_params;
+                    // pops below only touch the pool registers, so the
+                    // results survive in %rax/%rdx
+                    try self.unflush(self.depth);
+                    if (e.returns_width >= 1) try w.print("    movq %rax, {s}\n", .{self.push()});
+                    if (e.returns_width >= 2) try w.print("    movq %rdx, {s}\n", .{self.push()});
+                } else {
+                    if (e.returns_width >= 1) try w.writeAll("    pushq %rax\n");
+                    if (e.returns_width >= 2) try w.writeAll("    pushq %rdx\n");
                 }
             },
             .ret => |has_value| {

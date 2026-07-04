@@ -5,6 +5,8 @@ pub const vm = @import("vm/vm.zig");
 pub const compiler = @import("compiler/compiler.zig");
 pub const value = @import("compiler/value.zig");
 pub const codegen_x86 = @import("compiler/codegen_x86.zig");
+pub const modules = @import("modules/registry.zig");
+pub const lexer = @import("lexer/lexer.zig");
 
 test "old vm tests" {
     comptime {
@@ -32,5 +34,6 @@ test "compiler tests" {
         _ = @import("./compiler/vm.zig");
         _ = @import("./compiler/compiler.zig");
         _ = @import("./compiler/codegen_x86.zig");
+        _ = @import("./modules/net.zig");
     }
 }

@@ -15,18 +15,30 @@ const modules = @import("../modules/registry.zig");
 const types_mod = @import("types.zig");
 const TypeId = types_mod.TypeId;
 
+/// A project-local module: `use name;` splices `src` into the token
+/// stream. Both fields must outlive the compiled program (instructions
+/// hold slices into module sources).
+pub const ModuleSource = struct {
+    name: []const u8,
+    src: []const u8,
+};
+
 /// Compile source into a flat instruction list. Variable names in the
 /// returned instructions are slices into `src`.
 pub fn compile(allocator: std.mem.Allocator, src: []const u8) ![]Instruction {
-    return compileInner(allocator, src, false);
+    return compileInner(allocator, src, false, &.{});
 }
 
 /// Like `compile`, but traces type checking to stderr as it emits.
 pub fn compileVerbose(allocator: std.mem.Allocator, src: []const u8) ![]Instruction {
-    return compileInner(allocator, src, true);
+    return compileInner(allocator, src, true, &.{});
 }
 
-fn compileInner(allocator: std.mem.Allocator, src: []const u8, trace: bool) ![]Instruction {
+pub fn compileWithModules(allocator: std.mem.Allocator, src: []const u8, extra_modules: []const ModuleSource, trace: bool) ![]Instruction {
+    return compileInner(allocator, src, trace, extra_modules);
+}
+
+fn compileInner(allocator: std.mem.Allocator, src: []const u8, trace: bool, extra_modules: []const ModuleSource) ![]Instruction {
     var compiler = Compiler{
         .allocator = allocator,
         .src = src,
@@ -34,8 +46,10 @@ fn compileInner(allocator: std.mem.Allocator, src: []const u8, trace: bool) ![]I
         .instructions = .empty,
         .trace = trace,
         .types = try types_mod.TypeTable.init(allocator),
+        .extra_modules = extra_modules,
     };
     defer compiler.types.deinit();
+    defer compiler.lexer_stack.deinit(allocator);
     errdefer compiler.instructions.deinit(allocator);
     defer compiler.type_stack.deinit(allocator);
     defer compiler.var_types.deinit(allocator);
@@ -114,6 +128,17 @@ const Compiler = struct {
     /// user methods attached with `add(type) fn ...`, keyed by the
     /// mangled "type.name" (keys owned by the compiler)
     methods: std.StringHashMapUnmanaged(FnInfo) = .empty,
+    /// project-local modules available to `use`
+    extra_modules: []const ModuleSource,
+    /// saved lexers while a module source is spliced in; nonempty
+    /// exactly when compiling module code (which is what licenses
+    /// `extern fn` declarations)
+    lexer_stack: std.ArrayList(SavedLexer) = .empty,
+
+    const SavedLexer = struct {
+        lexer: Lexer,
+        src: []const u8,
+    };
 
     const VarInfo = struct {
         slot: u32,
@@ -132,6 +157,8 @@ const Compiler = struct {
         num_slots: u32,
         /// false while the body is still being compiled
         finalized: bool,
+        /// declared with `extern fn`: calls lower to call_extern
+        is_extern: bool = false,
     };
 
     /// The statement <-> block recursion (if/while bodies contain
@@ -158,6 +185,7 @@ const Compiler = struct {
         UnsupportedType,
         UnknownModule,
         ModuleNotEnabled,
+        ExternOutsideModule,
     };
 
     fn compileProgram(self: *Compiler) Error!void {
@@ -191,6 +219,7 @@ const Compiler = struct {
             .keyword_return => try self.compileReturn(),
             .keyword_use => try self.compileUse(),
             .keyword_type => try self.compileTypeAlias(),
+            .keyword_extern => try self.compileExtern(),
             .identifier => {
                 const name = token.getValue(self.src);
                 const after = self.next();
@@ -440,6 +469,14 @@ const Compiler = struct {
         if (info.return_type) |t| {
             try self.type_stack.append(self.allocator, t);
         }
+        if (info.is_extern) {
+            try self.emit(.{ .call_extern = .{
+                .symbol = name,
+                .num_params = info.param_slots,
+                .returns_width = if (info.return_type) |rt| self.types.width(rt) else 0,
+            } });
+            return info.return_type;
+        }
         const call_index = self.instructions.items.len;
         try self.emit(.{ .call = .{
             .name = name,
@@ -455,13 +492,114 @@ const Compiler = struct {
         return info.return_type;
     }
 
-    /// use name; — enable a built-in module (top level only).
+    /// use name; — enable a module (top level only). Built-in modules
+    /// gate language surface and may carry Stacy source; project-local
+    /// modules are pure source. Sources are spliced into the token
+    /// stream right here — declare-before-use, generalized to files.
     fn compileUse(self: *Compiler) Error!void {
         if (self.in_function or self.block_depth > 0) return error.UnexpectedToken;
         const name_token = try self.expect(.identifier);
-        const module = modules.find(name_token.getValue(self.src)) orelse return error.UnknownModule;
+        const use_name = name_token.getValue(self.src);
         _ = try self.expect(.semicolon);
-        try self.enabled_modules.put(self.allocator, module.name, {});
+
+        if (modules.find(use_name)) |module| {
+            if (self.enabled_modules.contains(module.name)) return; // idempotent
+            try self.enabled_modules.put(self.allocator, module.name, {});
+            if (module.stacy_source) |source| {
+                try self.spliceModule(source);
+            }
+            return;
+        }
+        for (self.extra_modules) |extra| {
+            if (std.mem.eql(u8, extra.name, use_name)) {
+                if (self.enabled_modules.contains(extra.name)) return;
+                try self.enabled_modules.put(self.allocator, extra.name, {});
+                try self.spliceModule(extra.src);
+                return;
+            }
+        }
+        return error.UnknownModule;
+    }
+
+    /// Switch the token stream to a module's source; the previous
+    /// lexer resumes when it runs out. Statements never straddle the
+    /// boundary (use ends with `;`), so the pushback buffer is empty.
+    fn spliceModule(self: *Compiler, module_src: []const u8) Error!void {
+        std.debug.assert(self.pushback_len == 0);
+        try self.lexer_stack.append(self.allocator, .{ .lexer = self.lexer, .src = self.src });
+        self.lexer = Lexer.init(module_src) catch return error.UnexpectedToken;
+        self.src = module_src;
+    }
+
+    /// extern fn name(p:type, ...) [:type] ;
+    ///
+    /// Only modules may declare externs: the `use` list of a program is
+    /// therefore its capability manifest. Marshaling constraints (SysV,
+    /// GPRs only): no floats anywhere, at most 6 argument slots, return
+    /// width at most 2.
+    fn compileExtern(self: *Compiler) Error!void {
+        if (self.lexer_stack.items.len == 0) return error.ExternOutsideModule;
+        if (self.in_function or self.block_depth > 0) return error.UnexpectedToken;
+        _ = try self.expect(.keyword_fn);
+        const name_token = try self.expect(.identifier);
+        const name = name_token.getValue(self.src);
+        if (self.fn_table.contains(name)) return error.DuplicateDefinition;
+        _ = try self.expect(.l_paren);
+
+        var params: std.ArrayList(TypeId) = .empty;
+        errdefer params.deinit(self.allocator);
+        var param_slots: u32 = 0;
+        var token = self.next();
+        if (token.tag != .r_paren) {
+            self.pushBack(token);
+            while (true) {
+                _ = try self.expect(.identifier); // parameter name, unused
+                _ = try self.expect(.colon);
+                const type_token = try self.expect(.identifier);
+                const param_type = try self.resolveType(type_token.getValue(self.src));
+                if (self.containsFloat(param_type)) return error.UnsupportedType;
+                param_slots += self.types.width(param_type);
+                try params.append(self.allocator, param_type);
+                const sep = self.next();
+                if (sep.tag == .r_paren) break;
+                if (sep.tag != .comma) return error.UnexpectedToken;
+            }
+        }
+        if (param_slots > 6) return error.UnsupportedType;
+
+        var return_type: ?TypeId = null;
+        token = self.next();
+        if (token.tag == .colon) {
+            const type_token = try self.expect(.identifier);
+            return_type = try self.resolveType(type_token.getValue(self.src));
+            if (self.containsFloat(return_type.?)) return error.UnsupportedType;
+            if (self.types.width(return_type.?) > 2) return error.UnsupportedType;
+            token = self.next();
+        }
+        if (token.tag != .semicolon) return error.UnexpectedToken;
+
+        try self.fn_table.put(self.allocator, name, .{
+            .entry = 0,
+            .params = try params.toOwnedSlice(self.allocator),
+            .param_slots = param_slots,
+            .return_type = return_type,
+            .num_slots = 0,
+            .finalized = true,
+            .is_extern = true,
+        });
+        if (self.trace) {
+            std.debug.print("── extern {s} ({d} slots) ──\n", .{ name, param_slots });
+        }
+    }
+
+    /// Does the flattened layout contain an f64 anywhere? (Extern
+    /// marshaling is GPR-only.)
+    fn containsFloat(self: *Compiler, id: TypeId) bool {
+        if (self.types.scalarOf(id)) |kind| return kind == .f64;
+        for (self.types.get(id).fields) |field| {
+            if (self.containsFloat(field.type)) return true;
+        }
+        return false;
     }
 
     /// type name = existing_type;  or  type Name = { f:type, ... };
@@ -573,7 +711,8 @@ const Compiler = struct {
     fn stringLiteralsEnabled(self: *Compiler) bool {
         var it = self.enabled_modules.keyIterator();
         while (it.next()) |name| {
-            if (modules.find(name.*).?.provides_string_literals) return true;
+            const module = modules.find(name.*) orelse continue; // project-local
+            if (module.provides_string_literals) return true;
         }
         return false;
     }
@@ -582,7 +721,7 @@ const Compiler = struct {
     fn findIntrinsic(self: *Compiler, receiver: TypeId, name: []const u8) ?modules.IntrinsicMethod {
         var it = self.enabled_modules.keyIterator();
         while (it.next()) |module_name| {
-            const module = modules.find(module_name.*).?;
+            const module = modules.find(module_name.*) orelse continue; // project-local
             for (module.intrinsics) |intrinsic| {
                 if (types_mod.TypeTable.builtinId(intrinsic.receiver) == receiver and std.mem.eql(u8, intrinsic.name, name)) {
                     return intrinsic;
@@ -1122,11 +1261,21 @@ const Compiler = struct {
     }
 
     fn nextFromLexer(self: *Compiler) Token {
-        return self.lexer.next() orelse Token{
-            .start = self.src.len,
-            .end = self.src.len,
-            .tag = .eof,
-        };
+        while (true) {
+            const token = self.lexer.next() orelse Token{
+                .start = self.src.len,
+                .end = self.src.len,
+                .tag = .eof,
+            };
+            if (token.tag == .eof and self.lexer_stack.items.len > 0) {
+                // a spliced module ran out; resume the outer source
+                const saved = self.lexer_stack.pop().?;
+                self.lexer = saved.lexer;
+                self.src = saved.src;
+                continue;
+            }
+            return token;
+        }
     }
 
     fn pushBack(self: *Compiler, token: Token) void {
@@ -1776,7 +1925,6 @@ test "static error: method collisions and unknown methods" {
     try std.testing.expectError(error.UnknownField, compile(std.testing.allocator, "let x = 1; print(x.missing());"));
 }
 
-
 // ── tuples and structs (type vectors) ──────────────────────────────
 
 test "tuples: construction is free, access is positional" {
@@ -1808,8 +1956,7 @@ test "structs: nesting flattens" {
         \\l.b.x = 99;
         \\print(l.b.x);
         \\print(l.a.0);
-    , "0.5\n99\n1\n")
-;
+    , "0.5\n99\n1\n");
 }
 
 test "structs: parameters and methods" {
@@ -1853,8 +2000,107 @@ test "static error: struct declarations" {
 }
 
 test "nominal identity: two structs with the same shape are distinct" {
-    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator,
-        "type A = { x:i64, y:i64 }; type B = { x:i64, y:i64 }; let a:A = (1, 2); let b:B = a;"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "type A = { x:i64, y:i64 }; type B = { x:i64, y:i64 }; let a:A = (1, 2); let b:B = a;"));
+}
+
+// ── module splicing (rung 2) and externs (rung 3) ──────────────────
+
+fn interpretModulesCapture(src: []const u8, extra: []const ModuleSource, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    const program = try compileWithModules(allocator, src, extra, false);
+    defer allocator.free(program);
+    var vm = Vm.init(allocator, &aw.writer);
+    defer vm.deinit();
+    try vm.run(program);
+    try std.testing.expectEqualStrings(expected, aw.writer.buffered());
+}
+
+test "rung 2: use splices a project-local module" {
+    const vec = [_]ModuleSource{.{
+        .name = "vec",
+        .src =
+        \\type Vec = { x:i64, y:i64 };
+        \\add(Vec) fn sum():i64 { return self.x + self.y; }
+        \\fn origin_dist(v:Vec):i64 { return v.x + v.y; }
+        ,
+    }};
+    try interpretModulesCapture(
+        \\use vec;
+        \\let v:Vec = (1, 2);
+        \\print(v.sum());
+        \\print(origin_dist((10, 20)));
+    , &vec, "3\n30\n");
+}
+
+test "rung 2: modules use other modules transitively" {
+    const wrap = [_]ModuleSource{.{
+        .name = "strwrap",
+        .src =
+        \\use str;
+        \\add(str) fn first():i64 { return self[0]; }
+        ,
+    }};
+    // main never says `use str;` directly; strwrap enables it
+    try interpretModulesCapture(
+        \\use strwrap;
+        \\print("hi".first());
+        \\print("literal works because strwrap used str");
+    , &wrap, "104\nliteral works because strwrap used str\n");
+}
+
+test "rung 2: use is idempotent across module boundaries" {
+    const a = [_]ModuleSource{
+        .{ .name = "a", .src = "use b;\nfn fa():i64 { return fb() + 1; }" },
+        .{ .name = "b", .src = "fn fb():i64 { return 41; }" },
+    };
+    try interpretModulesCapture("use a; use b; print(fa());", &a, "42\n");
+}
+
+test "rung 3: extern declarations are module-only" {
+    try std.testing.expectError(error.ExternOutsideModule, compile(std.testing.allocator, "extern fn foo():i64;"));
+}
+
+test "rung 3: extern marshaling constraints" {
+    const bad_float = [_]ModuleSource{.{ .name = "m", .src = "extern fn f(x:f64):i64;" }};
+    try std.testing.expectError(error.UnsupportedType, compileWithModules(std.testing.allocator, "use m;", &bad_float, false));
+
+    const too_many = [_]ModuleSource{.{ .name = "m", .src = "extern fn f(a:i64, b:i64, c:i64, d:i64, e:i64, f:i64, g:i64):i64;" }};
+    try std.testing.expectError(error.UnsupportedType, compileWithModules(std.testing.allocator, "use m;", &too_many, false));
+}
+
+test "rung 3: use net compiles to call_extern with struct return" {
+    const allocator = std.testing.allocator;
+    const program = try compile(allocator, "use net; let s = net_connect(\"127.0.0.1\", 1); print(s.fd);");
+    defer allocator.free(program);
+    // the spliced module body contains other call_externs (net_send in
+    // the send method); find the connect call specifically
+    var found = false;
+    for (program) |inst| {
+        switch (inst) {
+            .call_extern => |e| {
+                if (!std.mem.eql(u8, e.symbol, "net_connect")) continue;
+                try std.testing.expectEqual(@as(u32, 3), e.num_params); // str = 2 slots + port
+                try std.testing.expectEqual(@as(u32, 1), e.returns_width); // socket = 1 slot
+                found = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "rung 3: unknown extern symbol is a VM error" {
+    const m = [_]ModuleSource{.{ .name = "m", .src = "extern fn missing_symbol():i64;" }};
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    const program = try compileWithModules(allocator, "use m; print(missing_symbol());", &m, false);
+    defer allocator.free(program);
+    var vm = Vm.init(allocator, &aw.writer);
+    defer vm.deinit();
+    try std.testing.expectError(error.UnknownExtern, vm.run(program));
 }
 
 test "runtime error: string bounds" {

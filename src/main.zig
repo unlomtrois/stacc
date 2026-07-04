@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const stacc = @import("stacc");
+const Lexer = stacc.lexer.Lexer;
 
 const usage_text =
     \\stacc - the Stacy compiler
@@ -67,10 +68,13 @@ pub fn main(init: std.process.Init) !void {
 
     const src = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20));
 
-    const program = if (verbose) blk: {
-        std.debug.print("── typecheck ──\n", .{});
-        break :blk try stacc.compiler.compileVerbose(allocator, src);
-    } else try stacc.compiler.compile(allocator, src);
+    // project-local modules: `use foo;` for a non-builtin name loads
+    // modules/foo.stacy (transitively)
+    var local_modules: std.ArrayList(stacc.compiler.ModuleSource) = .empty;
+    try collectLocalModules(allocator, io, src, &local_modules);
+
+    if (verbose) std.debug.print("── typecheck ──\n", .{});
+    const program = try stacc.compiler.compileWithModules(allocator, src, local_modules.items, verbose);
 
     if (verbose) {
         std.debug.print("── compiled {d} instructions ──\n", .{program.len});
@@ -142,13 +146,42 @@ fn compileNative(allocator: std.mem.Allocator, io: Io, program: []const stacc.co
         try file_writer.interface.flush();
     }
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = runtime_path, .data = stacc.codegen_x86.runtime_c });
+
+    // hybrid modules contribute their extern implementations to the link
+    var extra_c_paths: std.ArrayList([]const u8) = .empty;
+    {
+        var seen: std.ArrayList([]const u8) = .empty;
+        for (program) |inst| {
+            switch (inst) {
+                .call_extern => |e| {
+                    const impl = stacc.modules.nativeImplForSymbol(e.symbol) orelse continue;
+                    var already = false;
+                    for (seen.items) |ptr| {
+                        if (ptr.ptr == impl.ptr) already = true;
+                    }
+                    if (already) continue;
+                    try seen.append(allocator, impl);
+                    const impl_path = try std.fmt.allocPrint(allocator, "{s}.mod{d}.c", .{ out, extra_c_paths.items.len });
+                    try Io.Dir.cwd().writeFile(io, .{ .sub_path = impl_path, .data = impl });
+                    try extra_c_paths.append(allocator, impl_path);
+                },
+                else => {},
+            }
+        }
+    }
     defer if (!keep_asm) {
         Io.Dir.cwd().deleteFile(io, asm_path) catch {};
         Io.Dir.cwd().deleteFile(io, runtime_path) catch {};
+        for (extra_c_paths.items) |impl_path| {
+            Io.Dir.cwd().deleteFile(io, impl_path) catch {};
+        }
     };
 
-    const argv = [_][]const u8{ "zig", "cc", asm_path, runtime_path, "-o", out, "-lm" };
-    var child = try std.process.spawn(io, .{ .argv = &argv });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(allocator, &.{ "zig", "cc", asm_path, runtime_path });
+    try argv.appendSlice(allocator, extra_c_paths.items);
+    try argv.appendSlice(allocator, &.{ "-o", out, "-lm" });
+    var child = try std.process.spawn(io, .{ .argv = argv.items });
     const term = child.wait(io) catch |err| {
         std.debug.print("failed to run zig cc: {t}\n", .{err});
         return err;
@@ -156,5 +189,29 @@ fn compileNative(allocator: std.mem.Allocator, io: Io, program: []const stacc.co
     if (!term.success()) {
         std.debug.print("zig cc failed: {f}\n", .{term});
         return error.AssemblerFailed;
+    }
+}
+
+/// Lex-scan a source for `use <name>;` and load modules/<name>.stacy
+/// for names the builtin registry does not know, recursively. Missing
+/// files are left for the compiler to report as UnknownModule.
+fn collectLocalModules(allocator: std.mem.Allocator, io: Io, src: []const u8, out: *std.ArrayList(stacc.compiler.ModuleSource)) !void {
+    var lexer = Lexer.init(src) catch return;
+    var previous_was_use = false;
+    while (lexer.next()) |token| {
+        if (token.tag == .eof) break;
+        defer previous_was_use = token.tag == .keyword_use;
+        if (!previous_was_use or token.tag != .identifier) continue;
+        const name = token.getValue(src);
+        if (stacc.modules.find(name) != null) continue;
+        var known = false;
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing.name, name)) known = true;
+        }
+        if (known) continue;
+        const module_path = try std.fmt.allocPrint(allocator, "modules/{s}.stacy", .{name});
+        const module_src = Io.Dir.cwd().readFileAlloc(io, module_path, allocator, .limited(1 << 20)) catch continue;
+        try out.append(allocator, .{ .name = name, .src = module_src });
+        try collectLocalModules(allocator, io, module_src, out);
     }
 }

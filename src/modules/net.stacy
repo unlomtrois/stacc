@@ -1,0 +1,27 @@
+# net: TCP client sockets. Hosts are IPv4 dotted quads ("127.0.0.1");
+# there is no DNS resolution yet. All failures are reported through
+# values (a socket with fd < 0, send/close returning -1, recv
+# returning ""), identically on the VM and natively.
+use str;
+
+type socket = { fd:i64 };
+
+extern fn net_connect(host:str, port:i64):socket;
+extern fn net_send(fd:i64, data:str):i64;
+extern fn net_recv(fd:i64):str;
+extern fn net_close(fd:i64):i64;
+
+add(socket) fn ok():bool {
+    return self.fd >= 0;
+}
+
+add(socket) fn send(data:str):i64 {
+    return net_send(self.fd, data);
+}
+
+add(socket) fn close():i64 {
+    return net_close(self.fd);
+}
+
+# receive is a free function (methods cannot return str yet):
+#     let reply = net_recv(s.fd);

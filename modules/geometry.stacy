@@ -1,0 +1,17 @@
+# a project-local module (rung 2): `use geometry;` splices this file
+# into the program at the point of the use. Pure Stacy, no compiler
+# involvement beyond the splice.
+
+type Point = { x:i64, y:i64 };
+
+add(Point) fn manhattan():i64 {
+    let ax = self.x;
+    let ay = self.y;
+    if (ax < 0) { ax = 0 - ax; }
+    if (ay < 0) { ay = 0 - ay; }
+    return ax + ay;
+}
+
+fn dot(a:Point, b:Point):i64 {
+    return a.x * b.x + a.y * b.y;
+}

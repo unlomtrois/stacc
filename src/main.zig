@@ -1,25 +1,24 @@
 const std = @import("std");
-const stacc_vm = @import("stacc").vm;
+const Io = std.Io;
+const stacc = @import("stacc");
 
-const tokenize = stacc_vm.tokenize;
-const execute = stacc_vm.execute;
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
+    const io = init.io;
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
+    const args = try init.minimal.args.toSlice(allocator);
     if (args.len < 2) {
-        std.debug.print("Usage: {s} <input>\n", .{args[0]});
+        std.debug.print("Usage: {s} <file.stacy>\n", .{args[0]});
         return error.NoInput;
     }
 
-    const input = args[1];
-    const tokens = try tokenize(input, allocator);
-    const result = try execute(tokens, allocator);
+    const src = try Io.Dir.cwd().readFileAlloc(io, args[1], allocator, .limited(1 << 20));
 
-    _ = result;
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const writer = &stdout_writer.interface;
+
+    try stacc.compiler.interpret(allocator, src, writer);
+
+    try writer.flush();
 }

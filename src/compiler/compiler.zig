@@ -1,0 +1,278 @@
+const std = @import("std");
+
+const Lexer = @import("../lexer/lexer.zig").Lexer;
+const Token = @import("../lexer/token.zig").Token;
+const shunting_yard = @import("../parser/shunting_yard.zig");
+const getPrecedence = shunting_yard.getPrecedence;
+const isLeftAssoc = shunting_yard.isLeftAssoc;
+
+const value_mod = @import("value.zig");
+const Value = value_mod.Value;
+const Instruction = @import("instruction.zig").Instruction;
+const Vm = @import("vm.zig").Vm;
+
+/// Compile source into a flat instruction list. Variable names in the
+/// returned instructions are slices into `src`.
+pub fn compile(allocator: std.mem.Allocator, src: []const u8) ![]Instruction {
+    var compiler = Compiler{
+        .allocator = allocator,
+        .src = src,
+        .lexer = try Lexer.init(src),
+        .instructions = .empty,
+    };
+    errdefer compiler.instructions.deinit(allocator);
+
+    try compiler.compileProgram();
+    return compiler.instructions.toOwnedSlice(allocator);
+}
+
+/// Compile and immediately execute `src`, printing to `writer`.
+pub fn interpret(allocator: std.mem.Allocator, src: []const u8, writer: *std.Io.Writer) !void {
+    const program = try compile(allocator, src);
+    defer allocator.free(program);
+
+    var vm = Vm.init(allocator, writer);
+    defer vm.deinit();
+    try vm.run(program);
+}
+
+const Compiler = struct {
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    lexer: Lexer,
+    instructions: std.ArrayList(Instruction),
+
+    fn compileProgram(self: *Compiler) !void {
+        while (true) {
+            const token = self.next();
+            switch (token.tag) {
+                .eof => return,
+                .keyword_let => try self.compileLet(),
+                .identifier => {
+                    if (std.mem.eql(u8, token.getValue(self.src), "print")) {
+                        try self.compilePrint();
+                    } else {
+                        return error.UnexpectedToken;
+                    }
+                },
+                else => return error.UnexpectedToken,
+            }
+        }
+    }
+
+    /// let name (: type)? = expr ;
+    fn compileLet(self: *Compiler) !void {
+        const name_token = try self.expect(.identifier);
+        const name = name_token.getValue(self.src);
+
+        var declared_type: ?value_mod.Type = null;
+        var token = self.next();
+        if (token.tag == .colon) {
+            const type_token = try self.expect(.identifier);
+            declared_type = value_mod.type_names.get(type_token.getValue(self.src)) orelse
+                return error.UnknownType;
+            token = self.next();
+        }
+        if (token.tag != .equal) return error.UnexpectedToken;
+
+        try self.compileExpression(.semicolon);
+        try self.emit(.{ .store = .{ .name = name, .declared_type = declared_type } });
+    }
+
+    /// print ( expr ) ;  — the identifier "print" is already consumed
+    fn compilePrint(self: *Compiler) !void {
+        _ = try self.expect(.l_paren);
+        try self.compileExpression(.r_paren);
+        _ = try self.expect(.semicolon);
+        try self.emit(.print);
+    }
+
+    /// Shunting-yard over one expression, emitting instructions in RPN
+    /// order. Consumes the terminator: either `;`, or the `)` that closes
+    /// the expression when `terminator == .r_paren`.
+    fn compileExpression(self: *Compiler, terminator: Token.Tag) !void {
+        var op_stack = std.ArrayList(Token.Tag).empty;
+        defer op_stack.deinit(self.allocator);
+
+        var emitted_anything = false;
+
+        while (true) {
+            const token = self.next();
+            switch (token.tag) {
+                .literal_number => {
+                    const text = token.getValue(self.src);
+                    const v: Value = if (std.mem.indexOfScalar(u8, text, '.') != null)
+                        .{ .f64 = try std.fmt.parseFloat(f64, text) }
+                    else
+                        .{ .i64 = try std.fmt.parseInt(i64, text, 10) };
+                    try self.emit(.{ .push_const = v });
+                    emitted_anything = true;
+                },
+                .identifier => {
+                    try self.emit(.{ .load = token.getValue(self.src) });
+                    emitted_anything = true;
+                },
+                .plus, .minus, .multiply, .divide, .caret => {
+                    const prec = getPrecedence(token.tag);
+                    while (op_stack.items.len > 0) {
+                        const top = op_stack.items[op_stack.items.len - 1];
+                        if (top == .l_paren) break;
+                        const top_prec = getPrecedence(top);
+                        if (top_prec > prec or (top_prec == prec and isLeftAssoc(token.tag))) {
+                            try self.emitOperator(op_stack.pop().?);
+                        } else break;
+                    }
+                    try op_stack.append(self.allocator, token.tag);
+                },
+                .l_paren => try op_stack.append(self.allocator, .l_paren),
+                .r_paren => {
+                    // pop until the matching '('; if there is none, this ')'
+                    // terminates a print(...) expression
+                    while (op_stack.items.len > 0) {
+                        const top = op_stack.pop().?;
+                        if (top == .l_paren) break;
+                        try self.emitOperator(top);
+                    } else {
+                        if (terminator == .r_paren) {
+                            if (!emitted_anything) return error.ExpectedExpression;
+                            return;
+                        }
+                        return error.UnmatchedParenthesis;
+                    }
+                },
+                .semicolon => {
+                    if (terminator != .semicolon) return error.UnexpectedToken;
+                    while (op_stack.pop()) |top| {
+                        if (top == .l_paren) return error.UnmatchedParenthesis;
+                        try self.emitOperator(top);
+                    }
+                    if (!emitted_anything) return error.ExpectedExpression;
+                    return;
+                },
+                .eof => return error.UnexpectedEof,
+                else => return error.UnsupportedOperator,
+            }
+        }
+    }
+
+    fn emitOperator(self: *Compiler, tag: Token.Tag) !void {
+        try self.emit(switch (tag) {
+            .plus => .add,
+            .minus => .sub,
+            .multiply => .mul,
+            .divide => .div,
+            .caret => .pow,
+            else => return error.UnsupportedOperator,
+        });
+    }
+
+    fn emit(self: *Compiler, inst: Instruction) !void {
+        try self.instructions.append(self.allocator, inst);
+    }
+
+    fn next(self: *Compiler) Token {
+        return self.lexer.next() orelse Token{
+            .start = self.src.len,
+            .end = self.src.len,
+            .tag = .eof,
+        };
+    }
+
+    fn expect(self: *Compiler, tag: Token.Tag) !Token {
+        const token = self.next();
+        if (token.tag != tag) return error.UnexpectedToken;
+        return token;
+    }
+};
+
+// ── tests ──────────────────────────────────────────────────────────
+
+fn interpretCapture(src: []const u8, expected_output: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+
+    try interpret(allocator, src, &aw.writer);
+    try std.testing.expectEqualStrings(expected_output, aw.writer.buffered());
+}
+
+test "compile let with precedence" {
+    const allocator = std.testing.allocator;
+    const program = try compile(allocator, "let x = 1 + 2 * 3;");
+    defer allocator.free(program);
+
+    try std.testing.expectEqual(@as(usize, 6), program.len);
+    try std.testing.expectEqual(Value{ .i64 = 1 }, program[0].push_const);
+    try std.testing.expectEqual(Value{ .i64 = 2 }, program[1].push_const);
+    try std.testing.expectEqual(Value{ .i64 = 3 }, program[2].push_const);
+    try std.testing.expectEqual(Instruction.mul, program[3]);
+    try std.testing.expectEqual(Instruction.add, program[4]);
+    try std.testing.expectEqualStrings("x", program[5].store.name);
+    try std.testing.expectEqual(@as(?value_mod.Type, null), program[5].store.declared_type);
+}
+
+test "compile typed let carries declared type" {
+    const allocator = std.testing.allocator;
+    const program = try compile(allocator, "let x:i8 = 5;");
+    defer allocator.free(program);
+
+    try std.testing.expectEqual(value_mod.Type.i8, program[1].store.declared_type.?);
+}
+
+test "end to end: target program" {
+    try interpretCapture(
+        "let x:i8 = 5 + 2; let y = x + 3;  print(y);",
+        "10\n",
+    );
+}
+
+test "end to end: parens and power" {
+    try interpretCapture("print((1 - 5) ^ 2);", "16\n");
+    try interpretCapture("print(3 + 4 * 2 / (1 - 5) ^ 2);", "3\n"); // integer division truncates
+}
+
+test "end to end: floats" {
+    try interpretCapture("let z = 1.5 + 2.5; print(z);", "4\n");
+}
+
+test "end to end: print inner parens" {
+    try interpretCapture("print((2 + 2) * 2);", "8\n");
+}
+
+test "error: unknown type" {
+    try std.testing.expectError(error.UnknownType, compile(std.testing.allocator, "let x:u7 = 5;"));
+}
+
+test "error: missing equal" {
+    try std.testing.expectError(error.UnexpectedToken, compile(std.testing.allocator, "let x 5;"));
+}
+
+test "error: empty expression" {
+    try std.testing.expectError(error.ExpectedExpression, compile(std.testing.allocator, "let x = ;"));
+}
+
+test "error: missing semicolon" {
+    try std.testing.expectError(error.UnexpectedEof, compile(std.testing.allocator, "let x = 5"));
+}
+
+test "error: unmatched parenthesis" {
+    try std.testing.expectError(error.UnmatchedParenthesis, compile(std.testing.allocator, "let x = (5;"));
+}
+
+test "error: bad statement start" {
+    try std.testing.expectError(error.UnexpectedToken, compile(std.testing.allocator, "5 + 5;"));
+}
+
+test "runtime error: undefined variable" {
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try std.testing.expectError(error.UndefinedVariable, interpret(allocator, "print(nope);", &aw.writer));
+}
+
+test "runtime error: overflow on typed let" {
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try std.testing.expectError(error.Overflow, interpret(allocator, "let x:i8 = 300;", &aw.writer));
+}

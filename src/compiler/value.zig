@@ -62,6 +62,12 @@ pub const Value = union(Type) {
             inline else => |v| try writer.print("{d}", .{v}),
         }
     }
+
+    /// `{f}` formatter: value with its type, e.g. `5:i8`
+    pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try self.write(writer);
+        try writer.print(":{s}", .{@tagName(self.getType())});
+    }
 };
 
 /// Result type of a binary operation: f64 if either side is float,

@@ -9,7 +9,7 @@ const isLeftAssoc = shunting_yard.isLeftAssoc;
 const value_mod = @import("value.zig");
 const Value = value_mod.Value;
 const Instruction = @import("instruction.zig").Instruction;
-const Vm = @import("vm.zig").Vm;
+pub const Vm = @import("vm.zig").Vm;
 
 /// Compile source into a flat instruction list. Variable names in the
 /// returned instructions are slices into `src`.

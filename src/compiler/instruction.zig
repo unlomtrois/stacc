@@ -90,13 +90,15 @@ pub const Instruction = union(enum) {
         returns_value: bool,
     };
 
+    /// Loads and stores are type-erased: language types flatten to a
+    /// base slot and a width in slots. Coercions are separate `convert`
+    /// instructions emitted by the compiler, so these are raw moves.
     pub const Load = struct {
         /// original variable name, kept only for disassembly
         name: []const u8,
         /// index into the VM's flat slot array
         slot: u32,
-        /// static type of the variable being loaded
-        type: Type,
+        width: u32 = 1,
     };
 
     pub const Store = struct {
@@ -104,10 +106,7 @@ pub const Instruction = union(enum) {
         name: []const u8,
         /// index into the VM's flat slot array
         slot: u32,
-        /// resolved type: the declared annotation, or the inferred
-        /// expression type. The VM coerces the stored value to it
-        /// (range-checked when narrowing).
-        type: Type,
+        width: u32 = 1,
     };
 
     /// `{f}` formatter, e.g. `i64.const 5`, `i32.add`, `i8.store x@0`
@@ -117,8 +116,16 @@ pub const Instruction = union(enum) {
                 try writer.print("{s}.const ", .{@tagName(v.getType())});
                 try v.write(writer);
             },
-            .load => |l| try writer.print("{s}.load {s}@{d}", .{ @tagName(l.type), l.name, l.slot }),
-            .store => |s| try writer.print("{s}.store {s}@{d}", .{ @tagName(s.type), s.name, s.slot }),
+            .load => |l| if (l.width == 1) {
+                try writer.print("load {s}@{d}", .{ l.name, l.slot });
+            } else {
+                try writer.print("load {s}@{d} ({d} slots)", .{ l.name, l.slot, l.width });
+            },
+            .store => |s| if (s.width == 1) {
+                try writer.print("store {s}@{d}", .{ s.name, s.slot });
+            } else {
+                try writer.print("store {s}@{d} ({d} slots)", .{ s.name, s.slot, s.width });
+            },
             .print => |t| try writer.print("{s}.print", .{@tagName(t)}),
             .enter => |n| try writer.print("enter {d}", .{n}),
             .fn_prologue => |f| {

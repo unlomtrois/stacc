@@ -12,6 +12,8 @@ const instruction_mod = @import("instruction.zig");
 pub const Instruction = instruction_mod.Instruction;
 pub const Vm = @import("vm.zig").Vm;
 const modules = @import("../modules/registry.zig");
+const types_mod = @import("types.zig");
+const TypeId = types_mod.TypeId;
 
 /// Compile source into a flat instruction list. Variable names in the
 /// returned instructions are slices into `src`.
@@ -31,7 +33,9 @@ fn compileInner(allocator: std.mem.Allocator, src: []const u8, trace: bool) ![]I
         .lexer = try Lexer.init(src),
         .instructions = .empty,
         .trace = trace,
+        .types = try types_mod.TypeTable.init(allocator),
     };
+    defer compiler.types.deinit();
     errdefer compiler.instructions.deinit(allocator);
     defer compiler.type_stack.deinit(allocator);
     defer compiler.var_types.deinit(allocator);
@@ -42,7 +46,6 @@ fn compileInner(allocator: std.mem.Allocator, src: []const u8, trace: bool) ![]I
         compiler.fn_table.deinit(allocator);
     }
     defer compiler.enabled_modules.deinit(allocator);
-    defer compiler.type_aliases.deinit(allocator);
     defer {
         var it = compiler.methods.iterator();
         while (it.next()) |entry| {
@@ -82,7 +85,7 @@ const Compiler = struct {
     pushback_len: u8 = 0,
     /// compile-time mirror of the runtime value stack: holds the static
     /// type of every value the compiled code will have pushed so far
-    type_stack: std.ArrayList(value_mod.Type) = .empty,
+    type_stack: std.ArrayList(TypeId) = .empty,
     /// compile-time symbol table: variable name -> slot index + static type.
     /// Names never reach the VM; compiled code addresses flat slots.
     var_types: std.StringHashMapUnmanaged(VarInfo) = .empty,
@@ -97,7 +100,7 @@ const Compiler = struct {
     /// inside a function body right now?
     in_function: bool = false,
     /// return type of the function being compiled (null = void)
-    current_return_type: ?value_mod.Type = null,
+    current_return_type: ?TypeId = null,
     /// nesting depth of { } blocks (fn declarations only allowed at 0)
     block_depth: u32 = 0,
     /// which token ended the last compileExpression (.comma or .r_paren
@@ -106,25 +109,25 @@ const Compiler = struct {
     /// modules enabled by `use name;` (keys are the registry's static
     /// module names)
     enabled_modules: std.StringHashMapUnmanaged(void) = .empty,
-    /// `type name = ...;` aliases
-    type_aliases: std.StringHashMapUnmanaged(value_mod.Type) = .empty,
+    /// the open language-type layer (builtins, tuples, structs, aliases)
+    types: types_mod.TypeTable,
     /// user methods attached with `add(type) fn ...`, keyed by the
     /// mangled "type.name" (keys owned by the compiler)
     methods: std.StringHashMapUnmanaged(FnInfo) = .empty,
 
     const VarInfo = struct {
         slot: u32,
-        type: value_mod.Type,
+        type: TypeId,
     };
 
     const FnInfo = struct {
         entry: usize,
         /// parameter types in order; owned by the compiler
-        params: []value_mod.Type,
+        params: []TypeId,
         /// total slots the parameters occupy (str params take 2)
         param_slots: u32,
         /// null = void function
-        return_type: ?value_mod.Type,
+        return_type: ?TypeId,
         /// full frame size (params + locals); valid once finalized
         num_slots: u32,
         /// false while the body is still being compiled
@@ -220,12 +223,12 @@ const Compiler = struct {
     /// flow jumps over it. The signature is registered before the body so
     /// recursive calls resolve; only the frame size of those calls needs
     /// backpatching afterwards.
-    fn compileFn(self: *Compiler, receiver: ?value_mod.Type) Error!void {
+    fn compileFn(self: *Compiler, receiver: ?TypeId) Error!void {
         if (self.in_function or self.block_depth > 0) return error.UnexpectedToken;
 
         const name_token = try self.expect(.identifier);
         const name = name_token.getValue(self.src);
-        const owner: []const u8 = if (receiver) |r| @tagName(r) else "";
+        const owner: []const u8 = if (receiver) |r| self.types.name(r) else "";
         if (receiver) |r| {
             // a method must not collide with another method or a module
             // intrinsic on the same type
@@ -250,14 +253,14 @@ const Compiler = struct {
             self.next_slot = saved_next_slot;
         };
 
-        var params: std.ArrayList(value_mod.Type) = .empty;
+        var params: std.ArrayList(TypeId) = .empty;
         errdefer params.deinit(self.allocator);
 
         // methods receive the value they were called on as an implicit
         // first parameter named `self`
         if (receiver) |r| {
             try self.var_types.put(self.allocator, "self", .{ .slot = 0, .type = r });
-            self.next_slot += value_mod.width(r);
+            self.next_slot += self.types.width(r);
             try params.append(self.allocator, r);
         }
 
@@ -274,7 +277,7 @@ const Compiler = struct {
                 const gop = try self.var_types.getOrPut(self.allocator, param_name);
                 if (gop.found_existing) return error.DuplicateDefinition;
                 gop.value_ptr.* = .{ .slot = self.next_slot, .type = param_type };
-                self.next_slot += value_mod.width(param_type);
+                self.next_slot += self.types.width(param_type);
                 try params.append(self.allocator, param_type);
 
                 const sep = self.next();
@@ -283,13 +286,13 @@ const Compiler = struct {
             }
         }
 
-        var return_type: ?value_mod.Type = null;
+        var return_type: ?TypeId = null;
         token = self.next();
         if (token.tag == .colon) {
             const type_token = try self.expect(.identifier);
             return_type = try self.resolveType(type_token.getValue(self.src));
             // v1: native returns pass through a single register
-            if (return_type == .str) return error.UnsupportedType;
+            if (self.types.width(return_type.?) > 1) return error.UnsupportedType;
             token = self.next();
         }
         if (token.tag != .l_brace) return error.UnexpectedToken;
@@ -387,12 +390,8 @@ const Compiler = struct {
         const return_type = self.current_return_type orelse
             return error.TypeMismatch; // void function returning a value
         const expr_type = try self.compileExpression(.semicolon);
-        if (!value_mod.canCoerce(expr_type, return_type)) return error.TypeMismatch;
-        if (expr_type != return_type) {
-            _ = self.type_stack.pop();
-            try self.type_stack.append(self.allocator, return_type);
-            try self.emit(.{ .convert = return_type });
-        }
+        if (!self.canCoerceIds(expr_type, return_type)) return error.TypeMismatch;
+        try self.emitConvertTo(expr_type, return_type);
         _ = self.type_stack.pop();
         try self.emit(.{ .ret = true });
     }
@@ -401,23 +400,23 @@ const Compiler = struct {
     /// argument expressions (with per-argument conversion to the param
     /// type) followed by the call. Returns the callee's return type; the
     /// type stack gains it for value-returning callees.
-    fn compileCall(self: *Compiler, name: []const u8) Error!?value_mod.Type {
+    fn compileCall(self: *Compiler, name: []const u8) Error!?TypeId {
         const info = self.fn_table.getPtr(name) orelse return error.UndefinedFunction;
         return self.compileCallCommon(info, name, "", 0);
     }
 
     /// receiver.name(args) — the receiver value is already on the stack
     /// (which is exactly where the implicit `self` parameter goes).
-    fn compileMethodCall(self: *Compiler, receiver: value_mod.Type, name: []const u8) Error!?value_mod.Type {
+    fn compileMethodCall(self: *Compiler, receiver: TypeId, name: []const u8) Error!?TypeId {
         var key_buf: [128]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ @tagName(receiver), name }) catch return error.UnknownField;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ self.types.name(receiver), name }) catch return error.UnknownField;
         const info = self.methods.getPtr(key) orelse return error.UnknownField;
-        return self.compileCallCommon(info, name, @tagName(receiver), 1);
+        return self.compileCallCommon(info, name, self.types.name(receiver), 1);
     }
 
     /// Shared call emission. `pre_pushed` counts values already on the
     /// stack that fill the leading parameters (the method receiver).
-    fn compileCallCommon(self: *Compiler, info: *FnInfo, name: []const u8, owner: []const u8, pre_pushed: usize) Error!?value_mod.Type {
+    fn compileCallCommon(self: *Compiler, info: *FnInfo, name: []const u8, owner: []const u8, pre_pushed: usize) Error!?TypeId {
         var arg_count: usize = pre_pushed;
         const first = self.next();
         if (first.tag == .r_paren) {
@@ -428,12 +427,8 @@ const Compiler = struct {
                 const arg_type = try self.compileExpression(.comma);
                 if (arg_count >= info.params.len) return error.ArgumentCountMismatch;
                 const param_type = info.params[arg_count];
-                if (!value_mod.canCoerce(arg_type, param_type)) return error.TypeMismatch;
-                if (arg_type != param_type) {
-                    _ = self.type_stack.pop();
-                    try self.type_stack.append(self.allocator, param_type);
-                    try self.emit(.{ .convert = param_type });
-                }
+                if (!self.canCoerceIds(arg_type, param_type)) return error.TypeMismatch;
+                try self.emitConvertTo(arg_type, param_type);
                 arg_count += 1;
                 if (self.last_terminator == .r_paren) break;
             }
@@ -469,18 +464,58 @@ const Compiler = struct {
         try self.enabled_modules.put(self.allocator, module.name, {});
     }
 
-    /// type name = existing_type; — an alias (top level only).
+    /// type name = existing_type;  or  type Name = { f:type, ... };
+    /// (top level only)
     fn compileTypeAlias(self: *Compiler) Error!void {
         if (self.in_function or self.block_depth > 0) return error.UnexpectedToken;
         const name_token = try self.expect(.identifier);
         const name = name_token.getValue(self.src);
+        if (self.types.byName(name) != null) return error.DuplicateDefinition;
         _ = try self.expect(.equal);
-        const target_token = try self.expect(.identifier);
-        const target = try self.resolveType(target_token.getValue(self.src));
-        _ = try self.expect(.semicolon);
-        const gop = try self.type_aliases.getOrPut(self.allocator, name);
-        if (gop.found_existing) return error.DuplicateDefinition;
-        gop.value_ptr.* = target;
+
+        const token = self.next();
+        if (token.tag == .l_brace) {
+            // struct declaration: nesting flattens in the table
+            var field_names: std.ArrayList([]const u8) = .empty;
+            defer field_names.deinit(self.allocator);
+            var field_types: std.ArrayList(TypeId) = .empty;
+            defer field_types.deinit(self.allocator);
+            while (true) {
+                const fname_token = try self.expect(.identifier);
+                const fname = fname_token.getValue(self.src);
+                for (field_names.items) |existing| {
+                    if (std.mem.eql(u8, existing, fname)) return error.DuplicateDefinition;
+                }
+                _ = try self.expect(.colon);
+                const ftype_token = try self.expect(.identifier);
+                try field_names.append(self.allocator, fname);
+                try field_types.append(self.allocator, try self.resolveType(ftype_token.getValue(self.src)));
+                const sep = self.next();
+                if (sep.tag == .r_brace) break;
+                if (sep.tag != .comma) return error.UnexpectedToken;
+            }
+            _ = try self.expect(.semicolon);
+            _ = try self.types.declareStruct(name, field_names.items, field_types.items);
+        } else if (token.tag == .identifier) {
+            const target = try self.resolveType(token.getValue(self.src));
+            _ = try self.expect(.semicolon);
+            try self.types.declareAlias(name, target);
+        } else {
+            return error.UnexpectedToken;
+        }
+    }
+
+    /// `.field` or `.index` after the dot; the dot is already consumed.
+    fn resolveFieldAccess(self: *Compiler, base: TypeId) Error!types_mod.Field {
+        const token = self.next();
+        if (token.tag == .identifier) {
+            return self.types.fieldByName(base, token.getValue(self.src)) orelse error.UnknownField;
+        }
+        if (token.tag == .literal_number) {
+            const index = std.fmt.parseInt(usize, token.getValue(self.src), 10) catch return error.UnknownField;
+            return self.types.fieldByIndex(base, index) orelse error.UnknownField;
+        }
+        return error.UnexpectedToken;
     }
 
     /// `add` was consumed and `(` too; if what follows matches
@@ -511,16 +546,28 @@ const Compiler = struct {
         return true;
     }
 
-    /// Resolve a type name through aliases and module gates.
-    fn resolveType(self: *Compiler, name: []const u8) Error!value_mod.Type {
-        if (self.type_aliases.get(name)) |t| return t;
-        const t = value_mod.type_names.get(name) orelse return error.UnknownType;
+    /// Resolve a type name through the table (aliases included) and
+    /// module gates.
+    fn resolveType(self: *Compiler, name: []const u8) Error!TypeId {
+        const id = self.types.byName(name) orelse return error.UnknownType;
         for (&modules.builtin) |*module| {
-            if (module.provides_type == t and !self.enabled_modules.contains(module.name)) {
-                return error.ModuleNotEnabled;
+            if (module.provides_type) |provided| {
+                if (types_mod.TypeTable.builtinId(provided) == id and !self.enabled_modules.contains(module.name)) {
+                    return error.ModuleNotEnabled;
+                }
             }
         }
-        return t;
+        return id;
+    }
+
+    /// Static coercibility over type ids: scalar rules as before, plus
+    /// free structural adoption of tuples into nominal types.
+    fn canCoerceIds(self: *Compiler, from: TypeId, to: TypeId) bool {
+        if (from == to) return true;
+        if (self.types.adoptable(from, to)) return true;
+        const from_kind = self.types.scalarOf(from) orelse return false;
+        const to_kind = self.types.scalarOf(to) orelse return false;
+        return value_mod.canCoerce(from_kind, to_kind);
     }
 
     fn stringLiteralsEnabled(self: *Compiler) bool {
@@ -532,12 +579,12 @@ const Compiler = struct {
     }
 
     /// Intrinsic methods provided by enabled modules.
-    fn findIntrinsic(self: *Compiler, receiver: value_mod.Type, name: []const u8) ?modules.IntrinsicMethod {
+    fn findIntrinsic(self: *Compiler, receiver: TypeId, name: []const u8) ?modules.IntrinsicMethod {
         var it = self.enabled_modules.keyIterator();
         while (it.next()) |module_name| {
             const module = modules.find(module_name.*).?;
             for (module.intrinsics) |intrinsic| {
-                if (intrinsic.receiver == receiver and std.mem.eql(u8, intrinsic.name, name)) {
+                if (types_mod.TypeTable.builtinId(intrinsic.receiver) == receiver and std.mem.eql(u8, intrinsic.name, name)) {
                     return intrinsic;
                 }
             }
@@ -596,7 +643,7 @@ const Compiler = struct {
     fn compileCondition(self: *Compiler) Error!void {
         _ = try self.expect(.l_paren);
         const cond_type = try self.compileExpression(.r_paren);
-        if (cond_type != .bool) return error.TypeMismatch;
+        if (cond_type != types_mod.bool_id) return error.TypeMismatch;
         _ = self.type_stack.pop(); // jump_if_false consumes the bool
     }
 
@@ -605,13 +652,26 @@ const Compiler = struct {
     /// statically coercible to it.
     fn compileAssign(self: *Compiler, name: []const u8) Error!void {
         const info = self.var_types.get(name) orelse return error.UndefinedVariable;
+        // optional field path: p.x = ..., line.b.y = ...
+        var target_slot = info.slot;
+        var target_type = info.type;
+        while (true) {
+            const t1 = self.next();
+            if (t1.tag != .dot) {
+                self.pushBack(t1);
+                break;
+            }
+            const field = try self.resolveFieldAccess(target_type);
+            target_slot += field.offset;
+            target_type = field.type;
+        }
         _ = try self.expect(.equal);
         const expr_type = try self.compileExpression(.semicolon);
-        if (!value_mod.canCoerce(expr_type, info.type)) return error.TypeMismatch;
-        try self.emitConvertTo(expr_type, info.type);
+        if (!self.canCoerceIds(expr_type, target_type)) return error.TypeMismatch;
+        try self.emitConvertTo(expr_type, target_type);
         _ = self.type_stack.pop(); // the store consumes the expression value
-        try self.emit(.{ .store = .{ .name = name, .slot = info.slot, .type = info.type } });
-        self.traceStore(name, info.type, expr_type, "assigned");
+        try self.emit(.{ .store = .{ .name = name, .slot = target_slot, .width = self.types.width(target_type) } });
+        self.traceStore(name, target_type, expr_type, "assigned");
     }
 
     /// Resolve a placeholder jump target to `target`.
@@ -630,7 +690,7 @@ const Compiler = struct {
         const name_token = try self.expect(.identifier);
         const name = name_token.getValue(self.src);
 
-        var declared_type: ?value_mod.Type = null;
+        var declared_type: ?TypeId = null;
         var token = self.next();
         if (token.tag == .colon) {
             const type_token = try self.expect(.identifier);
@@ -641,45 +701,54 @@ const Compiler = struct {
 
         const expr_type = try self.compileExpression(.semicolon);
         if (declared_type) |t| {
-            if (!value_mod.canCoerce(expr_type, t)) return error.TypeMismatch;
+            if (!self.canCoerceIds(expr_type, t)) return error.TypeMismatch;
         }
         const var_type = declared_type orelse expr_type;
         // redeclaration reuses the slot and just updates the static
         // type, unless the width changed (then the old slots are
         // abandoned and fresh ones allocated)
         const gop = try self.var_types.getOrPut(self.allocator, name);
-        if (!gop.found_existing or value_mod.width(gop.value_ptr.type) != value_mod.width(var_type)) {
+        if (!gop.found_existing or self.types.width(gop.value_ptr.type) != self.types.width(var_type)) {
             gop.value_ptr.slot = self.next_slot;
-            self.next_slot += value_mod.width(var_type);
+            self.next_slot += self.types.width(var_type);
         }
         gop.value_ptr.type = var_type;
         try self.emitConvertTo(expr_type, var_type);
         _ = self.type_stack.pop(); // the store consumes the expression value
-        try self.emit(.{ .store = .{ .name = name, .slot = gop.value_ptr.slot, .type = var_type } });
+        try self.emit(.{ .store = .{ .name = name, .slot = gop.value_ptr.slot, .width = self.types.width(var_type) } });
         if (declared_type != null) {
             self.traceStore(name, var_type, expr_type, "declared");
         } else if (self.trace) {
-            std.debug.print("  => {s}: {s} (inferred)\n", .{ name, @tagName(expr_type) });
+            std.debug.print("  => {s}: {s} (inferred)\n", .{ name, self.types.name(expr_type) });
         }
     }
 
     /// Emit a convert making the runtime top-of-stack match `target`.
     /// The caller has already established coercibility.
-    fn emitConvertTo(self: *Compiler, from: value_mod.Type, target: value_mod.Type) Error!void {
+    fn emitConvertTo(self: *Compiler, from: TypeId, target: TypeId) Error!void {
         if (from == target) return;
         self.type_stack.items[self.type_stack.items.len - 1] = target;
-        try self.emit(.{ .convert = target });
+        if (self.types.adoptable(from, target)) return; // relabel only: zero instructions
+        const kind = self.types.scalarOf(target).?; // guarded by canCoerceIds
+        try self.emit(.{ .convert = kind });
     }
 
     /// Trace verdict for a store into a variable of known type.
-    fn traceStore(self: *Compiler, name: []const u8, var_type: value_mod.Type, expr_type: value_mod.Type, comptime origin: []const u8) void {
+    fn traceStore(self: *Compiler, name: []const u8, var_type: TypeId, expr_type: TypeId, comptime origin: []const u8) void {
         if (!self.trace) return;
+        const vt = self.types.name(var_type);
         if (var_type == expr_type) {
-            std.debug.print("  => {s}: {s} (" ++ origin ++ ", expression matches)\n", .{ name, @tagName(var_type) });
-        } else if (value_mod.unify(expr_type, var_type) == var_type) {
-            std.debug.print("  => {s}: {s} (" ++ origin ++ ", {s} expression widened)\n", .{ name, @tagName(var_type), @tagName(expr_type) });
+            std.debug.print("  => {s}: {s} (" ++ origin ++ ", expression matches)\n", .{ name, vt });
+            return;
+        }
+        const vk = self.types.scalarOf(var_type);
+        const ek = self.types.scalarOf(expr_type);
+        if (vk == null or ek == null) {
+            std.debug.print("  => {s}: {s} (" ++ origin ++ ", adopted)\n", .{ name, vt });
+        } else if (value_mod.unify(ek.?, vk.?) == vk.?) {
+            std.debug.print("  => {s}: {s} (" ++ origin ++ ", {s} expression widened)\n", .{ name, vt, self.types.name(expr_type) });
         } else {
-            std.debug.print("  => {s}: {s} (" ++ origin ++ ", {s} expression narrowed at runtime, range-checked)\n", .{ name, @tagName(var_type), @tagName(expr_type) });
+            std.debug.print("  => {s}: {s} (" ++ origin ++ ", {s} expression narrowed at runtime, range-checked)\n", .{ name, vt, self.types.name(expr_type) });
         }
     }
 
@@ -688,7 +757,9 @@ const Compiler = struct {
         const expr_type = try self.compileExpression(.r_paren);
         _ = try self.expect(.semicolon);
         _ = self.type_stack.pop(); // print consumes the expression value
-        try self.emit(.{ .print = expr_type });
+        // printable = anything with a bytecode kind (tuples/structs are not, yet)
+        const kind = self.types.scalarOf(expr_type) orelse return error.TypeMismatch;
+        try self.emit(.{ .print = kind });
     }
 
     /// Shunting-yard over one expression, emitting instructions in RPN
@@ -702,8 +773,9 @@ const Compiler = struct {
     ///
     /// Expressions nest (function call arguments), so everything is
     /// relative to the type stack depth at entry.
-    fn compileExpression(self: *Compiler, terminator: Token.Tag) Error!value_mod.Type {
-        var op_stack = std.ArrayList(Token.Tag).empty;
+    fn compileExpression(self: *Compiler, terminator: Token.Tag) Error!TypeId {
+        const OpEntry = struct { tag: Token.Tag, commas: u32 = 0 };
+        var op_stack = std.ArrayList(OpEntry).empty;
         defer op_stack.deinit(self.allocator);
 
         const base = self.type_stack.items.len;
@@ -721,16 +793,19 @@ const Compiler = struct {
                         .{ .i64 = try std.fmt.parseInt(i64, text, 10) };
 
                     // optional literal type annotation: 5:i8
+                    var literal_type: ?TypeId = null;
                     const after = self.next();
                     if (after.tag == .colon) {
                         const type_token = try self.expect(.identifier);
                         const t = try self.resolveType(type_token.getValue(self.src));
-                        v = try v.coerce(t);
+                        const kind = self.types.scalarOf(t) orelse return error.TypeMismatch;
+                        v = try v.coerce(kind);
+                        literal_type = t;
                     } else {
                         self.pushBack(after);
                     }
 
-                    try self.type_stack.append(self.allocator, v.getType());
+                    try self.type_stack.append(self.allocator, literal_type orelse types_mod.TypeTable.builtinId(v.getType()));
                     try self.emit(.{ .push_const = v });
                     emitted_anything = true;
                 },
@@ -744,8 +819,34 @@ const Compiler = struct {
                     } else {
                         self.pushBack(after);
                         const info = self.var_types.get(name) orelse return error.UndefinedVariable;
-                        try self.type_stack.append(self.allocator, info.type);
-                        try self.emit(.{ .load = .{ .name = name, .slot = info.slot, .type = info.type } });
+                        // field paths resolve to static offsets before the
+                        // load; a trailing .name( is a method and stops the path
+                        var slot = info.slot;
+                        var vtype = info.type;
+                        while (true) {
+                            const t1 = self.next();
+                            if (t1.tag != .dot) {
+                                self.pushBack(t1);
+                                break;
+                            }
+                            const t2 = self.next();
+                            if (t2.tag == .identifier) {
+                                const t3 = self.next();
+                                if (t3.tag == .l_paren) {
+                                    self.pushBack(t3);
+                                    self.pushBack(t2);
+                                    self.pushBack(t1);
+                                    break;
+                                }
+                                self.pushBack(t3);
+                            }
+                            self.pushBack(t2);
+                            const field = try self.resolveFieldAccess(vtype);
+                            slot += field.offset;
+                            vtype = field.type;
+                        }
+                        try self.type_stack.append(self.allocator, vtype);
+                        try self.emit(.{ .load = .{ .name = name, .slot = slot, .width = self.types.width(vtype) } });
                         try self.compilePostfix();
                     }
                     emitted_anything = true;
@@ -754,7 +855,7 @@ const Compiler = struct {
                     if (!self.stringLiteralsEnabled()) return error.ModuleNotEnabled;
                     const quoted = token.getValue(self.src);
                     const bytes = quoted[1 .. quoted.len - 1]; // strip the quotes
-                    try self.type_stack.append(self.allocator, .str);
+                    try self.type_stack.append(self.allocator, types_mod.str_id);
                     try self.emit(.{ .push_str = bytes });
                     try self.compilePostfix();
                     emitted_anything = true;
@@ -774,28 +875,38 @@ const Compiler = struct {
                     const prec = getPrecedence(token.tag);
                     while (op_stack.items.len > 0) {
                         const top = op_stack.items[op_stack.items.len - 1];
-                        if (top == .l_paren) break;
-                        const top_prec = getPrecedence(top);
+                        if (top.tag == .l_paren) break;
+                        const top_prec = getPrecedence(top.tag);
                         if (top_prec > prec or (top_prec == prec and isLeftAssoc(token.tag))) {
-                            try self.emitOperator(op_stack.pop().?);
+                            try self.emitOperator(op_stack.pop().?.tag);
                         } else break;
                     }
-                    try op_stack.append(self.allocator, token.tag);
+                    try op_stack.append(self.allocator, .{ .tag = token.tag });
                 },
-                .l_paren => try op_stack.append(self.allocator, .l_paren),
+                .l_paren => try op_stack.append(self.allocator, .{ .tag = .l_paren }),
                 .r_paren => {
                     // pop until the matching '('; if there is none, this ')'
                     // terminates a print(...) expression
-                    var closed_group = false;
+                    var closed_group: ?u32 = null;
                     while (op_stack.items.len > 0) {
                         const top = op_stack.pop().?;
-                        if (top == .l_paren) {
-                            closed_group = true;
+                        if (top.tag == .l_paren) {
+                            closed_group = top.commas;
                             break;
                         }
-                        try self.emitOperator(top);
+                        try self.emitOperator(top.tag);
                     }
-                    if (closed_group) {
+                    if (closed_group) |commas| {
+                        if (commas > 0) {
+                            // (a, b, ...) — a tuple: concatenation is
+                            // adjacency, so this is a pure type-stack event
+                            const n: usize = commas + 1;
+                            if (self.type_stack.items.len < base + n) return error.InvalidExpression;
+                            const elements = self.type_stack.items[self.type_stack.items.len - n ..];
+                            const tuple = try self.types.internTuple(elements);
+                            self.type_stack.shrinkRetainingCapacity(self.type_stack.items.len - n);
+                            try self.type_stack.append(self.allocator, tuple);
+                        }
                         // postfix chains onto a parenthesized value:
                         // (x + 1).double()
                         try self.compilePostfix();
@@ -809,12 +920,16 @@ const Compiler = struct {
                     }
                 },
                 .comma => {
-                    if (terminator != .comma) return error.UnexpectedToken;
-                    while (op_stack.pop()) |top| {
-                        // a comma inside grouping parens is not valid
-                        if (top == .l_paren) return error.UnexpectedToken;
-                        try self.emitOperator(top);
+                    // drain the current group's pending operators
+                    while (op_stack.items.len > 0 and op_stack.items[op_stack.items.len - 1].tag != .l_paren) {
+                        try self.emitOperator(op_stack.pop().?.tag);
                     }
+                    if (op_stack.items.len > 0) {
+                        // inside ( ... ): a tuple element separator
+                        op_stack.items[op_stack.items.len - 1].commas += 1;
+                        continue;
+                    }
+                    if (terminator != .comma) return error.UnexpectedToken;
                     if (!emitted_anything) return error.ExpectedExpression;
                     self.last_terminator = .comma;
                     return self.finishExpression(base);
@@ -822,8 +937,8 @@ const Compiler = struct {
                 .semicolon => {
                     if (terminator != .semicolon) return error.UnexpectedToken;
                     while (op_stack.pop()) |top| {
-                        if (top == .l_paren) return error.UnmatchedParenthesis;
-                        try self.emitOperator(top);
+                        if (top.tag == .l_paren) return error.UnmatchedParenthesis;
+                        try self.emitOperator(top.tag);
                     }
                     if (!emitted_anything) return error.ExpectedExpression;
                     self.last_terminator = .semicolon;
@@ -840,8 +955,8 @@ const Compiler = struct {
                     };
                     if (!accepted) return error.UnexpectedToken;
                     while (op_stack.pop()) |top| {
-                        if (top == .l_paren) return error.UnmatchedParenthesis;
-                        try self.emitOperator(top);
+                        if (top.tag == .l_paren) return error.UnmatchedParenthesis;
+                        try self.emitOperator(top.tag);
                     }
                     if (!emitted_anything) return error.ExpectedExpression;
                     self.last_terminator = token.tag;
@@ -871,7 +986,7 @@ const Compiler = struct {
                     if (self.findIntrinsic(receiver, method_name)) |intrinsic| {
                         _ = try self.expect(.r_paren); // intrinsics take no arguments
                         _ = self.type_stack.pop();
-                        try self.type_stack.append(self.allocator, intrinsic.return_type);
+                        try self.type_stack.append(self.allocator, types_mod.TypeTable.builtinId(intrinsic.return_type));
                         switch (intrinsic.intrinsic) {
                             .str_len => try self.emit(.str_len),
                         }
@@ -881,24 +996,24 @@ const Compiler = struct {
                     }
                 },
                 .l_bracket => {
-                    if (self.typeStackTop() != .str) return error.TypeMismatch;
+                    if (self.typeStackTop() != types_mod.str_id) return error.TypeMismatch;
                     // first bound: ends at `..` (slice) or `]` (index)
                     const low_type = try self.compileExpression(.dot_dot);
-                    if (!value_mod.canCoerce(low_type, .i64)) return error.TypeMismatch;
-                    try self.emitConvertTo(low_type, .i64);
+                    if (!self.canCoerceIds(low_type, types_mod.i64_id)) return error.TypeMismatch;
+                    try self.emitConvertTo(low_type, types_mod.i64_id);
                     if (self.last_terminator == .dot_dot) {
                         const high_type = try self.compileExpression(.r_bracket);
-                        if (!value_mod.canCoerce(high_type, .i64)) return error.TypeMismatch;
-                        try self.emitConvertTo(high_type, .i64);
+                        if (!self.canCoerceIds(high_type, types_mod.i64_id)) return error.TypeMismatch;
+                        try self.emitConvertTo(high_type, types_mod.i64_id);
                         _ = self.type_stack.pop(); // high
                         _ = self.type_stack.pop(); // low
                         _ = self.type_stack.pop(); // the str
-                        try self.type_stack.append(self.allocator, .str);
+                        try self.type_stack.append(self.allocator, types_mod.str_id);
                         try self.emit(.str_slice);
                     } else {
                         _ = self.type_stack.pop(); // index
                         _ = self.type_stack.pop(); // the str
-                        try self.type_stack.append(self.allocator, .i64);
+                        try self.type_stack.append(self.allocator, types_mod.i64_id);
                         try self.emit(.str_index);
                     }
                 },
@@ -910,13 +1025,13 @@ const Compiler = struct {
         }
     }
 
-    fn typeStackTop(self: *Compiler) ?value_mod.Type {
+    fn typeStackTop(self: *Compiler) ?TypeId {
         if (self.type_stack.items.len == 0) return null;
         return self.type_stack.items[self.type_stack.items.len - 1];
     }
 
     /// A well-formed expression leaves exactly one new value on the stack.
-    fn finishExpression(self: *Compiler, base: usize) Error!value_mod.Type {
+    fn finishExpression(self: *Compiler, base: usize) Error!TypeId {
         if (self.type_stack.items.len != base + 1) return error.InvalidExpression;
         return self.type_stack.items[base];
     }
@@ -926,11 +1041,11 @@ const Compiler = struct {
         // push the result type
         if (self.type_stack.items.len < 2) return error.InvalidExpression;
         const items = self.type_stack.items;
-        var rhs = items[items.len - 1];
-        var lhs = items[items.len - 2];
+        const rhs = items[items.len - 1];
+        const lhs = items[items.len - 2];
         // strings support equality only
-        if (lhs == .str or rhs == .str) {
-            if (lhs != .str or rhs != .str) return error.TypeMismatch;
+        if (lhs == types_mod.str_id or rhs == types_mod.str_id) {
+            if (lhs != rhs) return error.TypeMismatch;
             const inst: Instruction = switch (tag) {
                 .equal_equal => .str_eq,
                 .not_equal => .str_ne,
@@ -938,25 +1053,25 @@ const Compiler = struct {
             };
             _ = self.type_stack.pop();
             _ = self.type_stack.pop();
-            try self.type_stack.append(self.allocator, .bool);
+            try self.type_stack.append(self.allocator, types_mod.bool_id);
             try self.emit(inst);
             return;
         }
-        // no arithmetic or ordering on bools (rules out chained comparisons
-        // like `1 < 2 < 3` as well)
-        if (lhs == .bool or rhs == .bool) return error.TypeMismatch;
-        const t = value_mod.unify(lhs, rhs);
+        // no arithmetic or ordering on bools or compounds (this also
+        // rules out chained comparisons like `1 < 2 < 3`)
+        if (lhs == types_mod.bool_id or rhs == types_mod.bool_id) return error.TypeMismatch;
+        const lhs_kind = self.types.scalarOf(lhs) orelse return error.TypeMismatch;
+        const rhs_kind = self.types.scalarOf(rhs) orelse return error.TypeMismatch;
+        const t = value_mod.unify(lhs_kind, rhs_kind);
 
         // ints widen for free at runtime, but int -> f64 changes the bit
         // representation, so native code needs it spelled out
-        if (t == .f64 and rhs != .f64) {
-            self.type_stack.items[items.len - 1] = .f64;
-            rhs = .f64;
+        if (t == .f64 and rhs_kind != .f64) {
+            self.type_stack.items[items.len - 1] = types_mod.f64_id;
             try self.emit(.{ .convert = .f64 });
         }
-        if (t == .f64 and lhs != .f64) {
-            self.type_stack.items[items.len - 2] = .f64;
-            lhs = .f64;
+        if (t == .f64 and lhs_kind != .f64) {
+            self.type_stack.items[items.len - 2] = types_mod.f64_id;
             try self.emit(.{ .convert_under = .f64 });
         }
         _ = self.type_stack.pop();
@@ -976,9 +1091,9 @@ const Compiler = struct {
             .greater_equal => .{ .ge = t },
             else => return error.UnsupportedOperator,
         };
-        const result_type: value_mod.Type = switch (tag) {
-            .equal_equal, .not_equal, .less_than, .greater_than, .less_equal, .greater_equal => .bool,
-            else => t,
+        const result_type: TypeId = switch (tag) {
+            .equal_equal, .not_equal, .less_than, .greater_than, .less_equal, .greater_equal => types_mod.bool_id,
+            else => types_mod.TypeTable.builtinId(t),
         };
         try self.type_stack.append(self.allocator, result_type);
         try self.emit(inst);
@@ -992,7 +1107,7 @@ const Compiler = struct {
             std.debug.print("  {s:<24} [", .{text});
             for (self.type_stack.items, 0..) |t, i| {
                 if (i > 0) std.debug.print(" ", .{});
-                std.debug.print("{s}", .{@tagName(t)});
+                std.debug.print("{s}", .{self.types.name(t)});
             }
             std.debug.print("]\n", .{});
         }
@@ -1052,7 +1167,7 @@ test "compile let with precedence" {
     try std.testing.expectEqual(Instruction{ .mul = .i64 }, program[4]);
     try std.testing.expectEqual(Instruction{ .add = .i64 }, program[5]);
     try std.testing.expectEqualStrings("x", program[6].store.name);
-    try std.testing.expectEqual(value_mod.Type.i64, program[6].store.type); // inferred
+    try std.testing.expectEqual(@as(u32, 1), program[6].store.width); // scalar, inferred
 }
 
 test "compile typed let carries declared type" {
@@ -1062,7 +1177,7 @@ test "compile typed let carries declared type" {
 
     // 0 enter, 1 const (i64), 2 convert i8, 3 store
     try std.testing.expectEqual(Instruction{ .convert = .i8 }, program[2]);
-    try std.testing.expectEqual(value_mod.Type.i8, program[3].store.type);
+    try std.testing.expectEqual(@as(u32, 1), program[3].store.width);
 }
 
 test "operators are typed by unification" {
@@ -1071,7 +1186,7 @@ test "operators are typed by unification" {
     defer allocator.free(program);
 
     // 4 load x (i8), 5 const 0.5, 6 convert_under f64 (int lhs), 7 f64.add
-    try std.testing.expectEqual(value_mod.Type.i8, program[4].load.type);
+    try std.testing.expectEqual(@as(u32, 0), program[4].load.slot); // x
     try std.testing.expectEqual(Instruction{ .convert_under = .f64 }, program[6]);
     try std.testing.expectEqual(Instruction{ .add = .f64 }, program[7]);
 }
@@ -1278,7 +1393,7 @@ test "comparison unifies operand types" {
     // 1 const 1:i8, 2 const 2.5, 3 convert_under f64 (int lhs), 4 f64.lt
     try std.testing.expectEqual(Instruction{ .convert_under = .f64 }, program[3]);
     try std.testing.expectEqual(Instruction{ .lt = .f64 }, program[4]);
-    try std.testing.expectEqual(value_mod.Type.bool, program[5].store.type);
+    try std.testing.expectEqual(@as(u32, 1), program[5].store.width);
 }
 
 test "bool variables and annotation" {
@@ -1659,6 +1774,87 @@ test "static error: method collisions and unknown methods" {
     try std.testing.expectError(error.DuplicateDefinition, compile(std.testing.allocator, "use str; add(str) fn len():i64 { return 0; }"));
     try std.testing.expectError(error.DuplicateDefinition, compile(std.testing.allocator, "add(i64) fn f():i64 { return 0; } add(i64) fn f():i64 { return 0; }"));
     try std.testing.expectError(error.UnknownField, compile(std.testing.allocator, "let x = 1; print(x.missing());"));
+}
+
+
+// ── tuples and structs (type vectors) ──────────────────────────────
+
+test "tuples: construction is free, access is positional" {
+    try interpretCapture("let t = (1, 2.5); print(t.0); print(t.1);", "1\n2.5\n");
+    // construction emits only the element pushes and the store
+    const allocator = std.testing.allocator;
+    const program = try compile(allocator, "let t = (1, 2);");
+    defer allocator.free(program);
+    try std.testing.expectEqual(@as(usize, 4), program.len); // enter, const, const, store
+    try std.testing.expectEqual(@as(u32, 2), program[3].store.width);
+}
+
+test "structs: declaration, adoption, field access and assignment" {
+    try interpretCapture(
+        \\type Point = { x:i64, y:f64 };
+        \\let p:Point = (1, 2.5);
+        \\print(p.x);
+        \\p.y = p.y * 2.0;
+        \\print(p.y);
+    , "1\n5\n");
+}
+
+test "structs: nesting flattens" {
+    try interpretCapture(
+        \\type Point = { x:i64, y:f64 };
+        \\type Line = { a:Point, b:Point };
+        \\let l:Line = ((1, 1.5), (10, 0.5));
+        \\print(l.b.y);
+        \\l.b.x = 99;
+        \\print(l.b.x);
+        \\print(l.a.0);
+    , "0.5\n99\n1\n")
+;
+}
+
+test "structs: parameters and methods" {
+    try interpretCapture(
+        \\type Point = { x:i64, y:f64 };
+        \\fn second(p:Point):f64 { return p.y; }
+        \\add(Point) fn sum():f64 { return self.y + 1.0; }
+        \\let p:Point = (4, 1.25);
+        \\print(second(p));
+        \\print(second((7, 0.5)));
+        \\print(p.sum());
+    , "1.25\n0.5\n2.25\n");
+}
+
+test "structs with str fields" {
+    try interpretCapture(
+        \\use str;
+        \\type Named = { name:str, id:i64 };
+        \\let n:Named = ("stacy", 7);
+        \\print(n.name);
+        \\print(n.name.len());
+        \\print(n.id);
+    , "stacy\n5\n7\n");
+}
+
+test "static error: tuple shape and type mismatches" {
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "type P = { x:i64, y:f64 }; let p:P = (1, 2);")); // 2 is i64, no coercion inside tuples
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "type P = { x:i64, y:f64 }; let p:P = (1, 2.5, 3);"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let t = (1, 2) + 1;"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let t = (1, 2); print(t);")); // tuples are not printable
+    try std.testing.expectError(error.UnknownField, compile(std.testing.allocator, "let t = (1, 2); print(t.2);"));
+    try std.testing.expectError(error.UnknownField, compile(std.testing.allocator, "type P = { x:i64, w:i64 }; let p:P = (1, 2); print(p.z);"));
+}
+
+test "static error: struct declarations" {
+    try std.testing.expectError(error.DuplicateDefinition, compile(std.testing.allocator, "type P = { x:i64 }; type P = { y:i64 };"));
+    try std.testing.expectError(error.DuplicateDefinition, compile(std.testing.allocator, "type P = { x:i64, x:f64 };"));
+    try std.testing.expectError(error.UnknownType, compile(std.testing.allocator, "type P = { x:nope };"));
+    // compound returns are still unsupported (single-register convention)
+    try std.testing.expectError(error.UnsupportedType, compile(std.testing.allocator, "type P = { x:i64, y:i64 }; fn f():P { return (1, 2); }"));
+}
+
+test "nominal identity: two structs with the same shape are distinct" {
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator,
+        "type A = { x:i64, y:i64 }; type B = { x:i64, y:i64 }; let a:A = (1, 2); let b:B = a;"));
 }
 
 test "runtime error: string bounds" {

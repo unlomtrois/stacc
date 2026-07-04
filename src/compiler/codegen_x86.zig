@@ -192,14 +192,14 @@ fn analyze(allocator: std.mem.Allocator, program: []const Instruction) !Plan {
         const builder: *RegionBuilder = if (fn_builder) |*b| b else &(main_builder.?);
         switch (inst) {
             .load => |l| {
-                builder.access(l.slot, index);
-                if (l.type == .str) builder.access(l.slot + 1, index);
-                depth += value_mod.width(l.type);
+                var k: u32 = 0;
+                while (k < l.width) : (k += 1) builder.access(l.slot + k, index);
+                depth += l.width;
             },
             .store => |s| {
-                builder.access(s.slot, index);
-                if (s.type == .str) builder.access(s.slot + 1, index);
-                depth -= value_mod.width(s.type);
+                var k: u32 = 0;
+                while (k < s.width) : (k += 1) builder.access(s.slot + k, index);
+                depth -= s.width;
             },
             .push_const => depth += 1,
             .push_str => depth += 2,
@@ -600,35 +600,22 @@ const Emitter = struct {
                 }
             },
             .load => |l| {
-                const home = self.region.slotLocation(&buf, l.slot);
-                if (reg_mode) {
-                    try w.print("    movq {s}, {s}    # load {s}\n", .{ home, self.push(), l.name });
-                    if (l.type == .str) {
-                        const len_home = self.region.slotLocation(&buf2, l.slot + 1);
-                        try w.print("    movq {s}, {s}\n", .{ len_home, self.push() });
-                    }
-                } else {
-                    try w.print("    pushq {s}    # load {s}\n", .{ home, l.name });
-                    if (l.type == .str) {
-                        const len_home = self.region.slotLocation(&buf2, l.slot + 1);
-                        try w.print("    pushq {s}\n", .{len_home});
+                var k: u32 = 0;
+                while (k < l.width) : (k += 1) {
+                    const home = self.region.slotLocation(&buf, l.slot + k);
+                    if (reg_mode) {
+                        try w.print("    movq {s}, {s}    # load {s}\n", .{ home, self.push(), l.name });
+                    } else {
+                        try w.print("    pushq {s}    # load {s}\n", .{ home, l.name });
                     }
                 }
             },
             .store => |s| {
-                if (s.type == .str) {
-                    // two slots: [ptr][len], len on top
-                    const len_home = self.region.slotLocation(&buf2, s.slot + 1);
-                    const ptr_home = self.region.slotLocation(&buf, s.slot);
-                    if (reg_mode) {
-                        try w.print("    movq {s}, {s}    # store {s}.len\n", .{ self.popTop(), len_home, s.name });
-                        try w.print("    movq {s}, {s}    # store {s}\n", .{ self.popTop(), ptr_home, s.name });
-                    } else {
-                        try w.print("    popq {s}    # store {s}.len\n", .{ len_home, s.name });
-                        try w.print("    popq {s}    # store {s}\n", .{ ptr_home, s.name });
-                    }
-                } else {
-                    const home = self.region.slotLocation(&buf, s.slot);
+                // slots come off the stack last-first
+                var k: u32 = s.width;
+                while (k > 0) {
+                    k -= 1;
+                    const home = self.region.slotLocation(&buf, s.slot + k);
                     if (reg_mode) {
                         try w.print("    movq {s}, {s}    # store {s}\n", .{ self.popTop(), home, s.name });
                     } else {

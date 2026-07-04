@@ -27,6 +27,7 @@ test "shunting yard" {
 test "compiler tests" {
     comptime {
         _ = @import("./compiler/value.zig");
+        _ = @import("./compiler/types.zig");
         _ = @import("./compiler/instruction.zig");
         _ = @import("./compiler/vm.zig");
         _ = @import("./compiler/compiler.zig");

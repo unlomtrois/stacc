@@ -1,0 +1,37 @@
+# types are flat vectors of machine scalars; structs and tuples are
+# labeled and unlabeled concatenation over the same machinery.
+use str;
+
+type Point = { x:i64, y:f64 };
+
+let p:Point = (1, 2.5);       # a tuple adopts Point: relabel, zero instructions
+print(p.x);                   # field access = static offset, scalar load
+p.y = p.y * 2.0;              # field assignment = scalar store
+print(p.y);
+
+let t = (p.x + 3, 7);         # anonymous tuple, positional access
+print(t.0);
+print(t.1);
+
+type Line = { a:Point, b:Point };   # nesting flattens: 4 slots
+let l:Line = (p, (10, 0.5));  # mixed adoption composes
+print(l.b.y);                 # l.b.y = one load at offset 3
+l.b.x = 99;
+print(l.b.x);
+
+fn second(pt:Point):f64 {     # structs pass by value (2 slots)
+    return pt.y;
+}
+print(second(p));
+print(second((4, 1.25)));     # tuples adopt at call sites too
+
+add(Point) fn manhattan():f64 {
+    return self.y + self.y;
+}
+print(p.manhattan());
+
+type Tag = { name:str, id:i64 };    # compounds compose: 3 slots
+let tag:Tag = ("stacy", 42);
+print(tag.name);
+print(tag.name.len());
+print(tag.id);

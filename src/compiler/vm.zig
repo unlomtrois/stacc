@@ -49,21 +49,17 @@ pub const Vm = struct {
             switch (inst) {
                 .push_const => |v| try self.stack.append(self.allocator, v),
                 .load => |l| {
-                    try self.stack.append(self.allocator, self.slots.items[self.slot_base + l.slot]);
-                    if (l.type == .str) {
-                        try self.stack.append(self.allocator, self.slots.items[self.slot_base + l.slot + 1]);
+                    var k: u32 = 0;
+                    while (k < l.width) : (k += 1) {
+                        try self.stack.append(self.allocator, self.slots.items[self.slot_base + l.slot + k]);
                     }
                 },
                 .store => |s| {
-                    if (s.type == .str) {
-                        const len = try self.pop();
-                        const ptr = try self.pop();
-                        if (len != .i64 or ptr != .ptr) return error.TypeMismatch;
-                        self.slots.items[self.slot_base + s.slot] = ptr;
-                        self.slots.items[self.slot_base + s.slot + 1] = len;
-                    } else {
-                        const v = try (try self.pop()).coerce(s.type);
-                        self.slots.items[self.slot_base + s.slot] = v;
+                    // raw slot moves; coercions are separate converts
+                    var k: u32 = s.width;
+                    while (k > 0) {
+                        k -= 1;
+                        self.slots.items[self.slot_base + s.slot + k] = try self.pop();
                     }
                 },
                 .push_str => |bytes| {
@@ -274,12 +270,13 @@ test "store and load roundtrip with annotation" {
     try runCapture(&.{
         .{ .enter = 2 },
         .{ .push_const = .{ .i64 = 7 } },
-        .{ .store = .{ .name = "x", .slot = 0, .type = .i8 } },
-        .{ .load = .{ .name = "x", .slot = 0, .type = .i8 } },
+        .{ .convert = .i8 },
+        .{ .store = .{ .name = "x", .slot = 0 } },
+        .{ .load = .{ .name = "x", .slot = 0 } },
         .{ .push_const = .{ .i64 = 3 } },
         .{ .add = .i64 },
-        .{ .store = .{ .name = "y", .slot = 1, .type = .i64 } },
-        .{ .load = .{ .name = "y", .slot = 1, .type = .i64 } },
+        .{ .store = .{ .name = "y", .slot = 1 } },
+        .{ .load = .{ .name = "y", .slot = 1 } },
         .{ .print = .i64 },
     }, "10\n");
 }
@@ -291,10 +288,12 @@ test "overflow on typed store" {
     var vm = Vm.init(allocator, &aw.writer);
     defer vm.deinit();
 
+    // narrowing is an explicit convert; stores are raw slot moves
     try std.testing.expectError(error.Overflow, vm.run(&.{
         .{ .enter = 1 },
         .{ .push_const = .{ .i64 = 300 } },
-        .{ .store = .{ .name = "x", .slot = 0, .type = .i8 } },
+        .{ .convert = .i8 },
+        .{ .store = .{ .name = "x", .slot = 0 } },
     }));
 }
 
@@ -379,8 +378,8 @@ test "call passes args into frame slots and ret resumes" {
     // fn double(x) { return x + x; }  at pc 1..4; main: call double(21), print
     try runCapture(&.{
         .{ .jump = 5 }, // skip over the body
-        .{ .load = .{ .name = "x", .slot = 0, .type = .i64 } }, // 1: body
-        .{ .load = .{ .name = "x", .slot = 0, .type = .i64 } },
+        .{ .load = .{ .name = "x", .slot = 0 } }, // 1: body
+        .{ .load = .{ .name = "x", .slot = 0 } },
         .{ .add = .i64 },
         .{ .ret = true },
         .{ .push_const = .{ .i64 = 21 } }, // 5: main
@@ -395,12 +394,12 @@ test "frames isolate slots across calls" {
         .{ .enter = 1 },
         .{ .jump = 5 },
         .{ .push_const = .{ .i64 = 99 } }, // 2: body
-        .{ .store = .{ .name = "y", .slot = 0, .type = .i64 } },
+        .{ .store = .{ .name = "y", .slot = 0 } },
         .{ .ret = false },
         .{ .push_const = .{ .i64 = 7 } }, // 5: main
-        .{ .store = .{ .name = "x", .slot = 0, .type = .i64 } },
+        .{ .store = .{ .name = "x", .slot = 0 } },
         .{ .call = .{ .name = "f", .target = 2, .num_params = 0, .num_slots = 1, .returns_value = false } },
-        .{ .load = .{ .name = "x", .slot = 0, .type = .i64 } },
+        .{ .load = .{ .name = "x", .slot = 0 } },
         .{ .print = .i64 },
     }, "7\n");
 }

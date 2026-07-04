@@ -1,0 +1,24 @@
+# if / else if / else, and bool variables
+let score = 42;
+
+if (score > 50) {
+    print(1);
+} else if (score > 40) {
+    print(2);
+} else {
+    print(3);
+}
+
+let passed:bool = score >= 40;
+print(passed);
+
+# nested: count down, branching on parity-ish condition
+let i = 3;
+while (i > 0) {
+    if (i == 2) {
+        print(100 + i);
+    } else {
+        print(i);
+    }
+    i = i - 1;
+}

@@ -28,7 +28,10 @@ pub const Vm = struct {
     pub fn run(self: *Vm, program: []const Instruction) !void {
         try self.allocateSlots(program);
 
-        for (program) |inst| {
+        var pc: usize = 0;
+        while (pc < program.len) {
+            const inst = program[pc];
+            pc += 1;
             switch (inst) {
                 .push_const => |v| try self.stack.append(self.allocator, v),
                 .load => |l| try self.stack.append(self.allocator, self.slots[l.slot]),
@@ -37,6 +40,13 @@ pub const Vm = struct {
                     self.slots[s.slot] = v;
                 },
                 inline .add, .sub, .mul, .div, .pow => |t, op| try self.binaryOp(@field(BinOp, @tagName(op)), t),
+                inline .eq, .ne, .lt, .gt, .le, .ge => |t, op| try self.comparisonOp(@field(CmpOp, @tagName(op)), t),
+                .jump => |target| pc = target,
+                .jump_if_false => |target| {
+                    const v = try self.pop();
+                    if (v != .bool) return error.TypeMismatch;
+                    if (!v.bool) pc = target;
+                },
                 .print => {
                     const v = try self.pop();
                     try v.write(self.writer);
@@ -70,12 +80,19 @@ pub const Vm = struct {
     }
 
     const BinOp = enum { add, sub, mul, div, pow };
+    const CmpOp = enum { eq, ne, lt, gt, le, ge };
 
     /// The result type `t` comes from the typed instruction (e.g. i32.add),
     /// resolved statically by the compiler's type checker.
     fn binaryOp(self: *Vm, comptime op: BinOp, t: Type) !void {
         const rhs = try self.pop();
         const lhs = try self.pop();
+
+        // safety net: the static type of a slot can diverge from its
+        // runtime value after a conditional redeclaration, so mismatched
+        // operands are a runtime error rather than undefined behavior
+        if (lhs == .bool or rhs == .bool) return error.TypeMismatch;
+        if (t != .f64 and (lhs == .f64 or rhs == .f64)) return error.TypeMismatch;
 
         const result: Value = if (t == .f64) blk: {
             const a = lhs.asF64();
@@ -102,6 +119,41 @@ pub const Vm = struct {
         };
 
         try self.stack.append(self.allocator, result);
+    }
+
+    /// Comparisons are typed by their operand type and push a bool.
+    fn comparisonOp(self: *Vm, comptime op: CmpOp, t: Type) !void {
+        const rhs = try self.pop();
+        const lhs = try self.pop();
+
+        if (lhs == .bool or rhs == .bool) return error.TypeMismatch;
+        if (t != .f64 and (lhs == .f64 or rhs == .f64)) return error.TypeMismatch;
+
+        const result = if (t == .f64) blk: {
+            const a = lhs.asF64();
+            const b = rhs.asF64();
+            break :blk switch (op) {
+                .eq => a == b,
+                .ne => a != b,
+                .lt => a < b,
+                .gt => a > b,
+                .le => a <= b,
+                .ge => a >= b,
+            };
+        } else blk: {
+            const a = lhs.asI64();
+            const b = rhs.asI64();
+            break :blk switch (op) {
+                .eq => a == b,
+                .ne => a != b,
+                .lt => a < b,
+                .gt => a > b,
+                .le => a <= b,
+                .ge => a >= b,
+            };
+        };
+
+        try self.stack.append(self.allocator, .{ .bool = result });
     }
 };
 
@@ -163,6 +215,69 @@ test "division by zero" {
         .{ .push_const = .{ .i64 = 1 } },
         .{ .push_const = .{ .i64 = 0 } },
         .{ .div = .i64 },
+    }));
+}
+
+test "comparison pushes bool" {
+    try runCapture(&.{
+        .{ .push_const = .{ .i64 = 1 } },
+        .{ .push_const = .{ .i64 = 2 } },
+        .{ .lt = .i64 },
+        .print,
+    }, "true\n");
+}
+
+test "jump skips instructions" {
+    try runCapture(&.{
+        .{ .jump = 3 },
+        .{ .push_const = .{ .i64 = 1 } }, // skipped
+        .print, // skipped
+        .{ .push_const = .{ .i64 = 2 } },
+        .print,
+    }, "2\n");
+}
+
+test "jump_if_false branches on the popped bool" {
+    try runCapture(&.{
+        .{ .push_const = .{ .bool = false } },
+        .{ .jump_if_false = 4 },
+        .{ .push_const = .{ .i64 = 1 } }, // skipped
+        .print, // skipped
+        .{ .push_const = .{ .i64 = 2 } },
+        .print,
+        .{ .push_const = .{ .bool = true } },
+        .{ .jump_if_false = 11 }, // not taken
+        .{ .push_const = .{ .i64 = 3 } },
+        .print,
+    }, "2\n3\n");
+}
+
+test "jump_if_false rejects non-bool at runtime" {
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    var vm = Vm.init(allocator, &aw.writer);
+    defer vm.deinit();
+
+    try std.testing.expectError(error.TypeMismatch, vm.run(&.{
+        .{ .push_const = .{ .i64 = 1 } },
+        .{ .jump_if_false = 0 },
+    }));
+}
+
+test "arithmetic rejects mismatched runtime operand types" {
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    var vm = Vm.init(allocator, &aw.writer);
+    defer vm.deinit();
+
+    // an i64.add whose operand is really f64 (possible after conditional
+    // redeclaration) must error, not hit unreachable
+    try std.testing.expectError(error.TypeMismatch, vm.run(&.{
+        .{ .push_const = .{ .f64 = 1.5 } },
+        .{ .push_const = .{ .i64 = 1 } },
+        .{ .add = .i64 },
     }));
 }
 

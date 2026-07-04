@@ -6,6 +6,9 @@ const Token = @import("token.zig").Token;
 
 const keywords = std.StaticStringMap(Token.Tag).initComptime(.{
     .{ "let", .keyword_let },
+    .{ "if", .keyword_if },
+    .{ "else", .keyword_else },
+    .{ "while", .keyword_while },
 });
 
 const UTF8_BOM_SEQUENCE = "\xEF\xBB\xBF";
@@ -379,6 +382,15 @@ test "UTF-8 strings" {
     try std.testing.expectEqualStrings("\"Linnéa José\"", t.getValue(src));
 
     try std.testing.expectEqual(Token.Tag.eof, lexer.next().?.tag);
+}
+
+test "control flow keywords" {
+    const src = "if (x) { } else { } while (x) { }";
+    try helper(src, &[_]Token.Tag{
+        .keyword_if,    .l_paren, .identifier, .r_paren, .l_brace, .r_brace,
+        .keyword_else,  .l_brace, .r_brace,
+        .keyword_while, .l_paren, .identifier, .r_paren, .l_brace, .r_brace,
+    });
 }
 
 test "colon for type annotations" {

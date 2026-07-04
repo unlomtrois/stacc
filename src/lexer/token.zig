@@ -19,6 +19,9 @@ pub const Token = struct {
 
         // Keywords
         keyword_let,
+        keyword_if,
+        keyword_else,
+        keyword_while,
 
         // Literals
         literal_number, // 108

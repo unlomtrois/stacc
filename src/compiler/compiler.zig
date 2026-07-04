@@ -8,7 +8,8 @@ const isLeftAssoc = shunting_yard.isLeftAssoc;
 
 const value_mod = @import("value.zig");
 const Value = value_mod.Value;
-const Instruction = @import("instruction.zig").Instruction;
+const instruction_mod = @import("instruction.zig");
+const Instruction = instruction_mod.Instruction;
 pub const Vm = @import("vm.zig").Vm;
 
 /// Compile source into a flat instruction list. Variable names in the
@@ -70,21 +71,135 @@ const Compiler = struct {
         type: value_mod.Type,
     };
 
-    fn compileProgram(self: *Compiler) !void {
+    /// The statement <-> block recursion (if/while bodies contain
+    /// statements) needs an explicit error set; Zig cannot infer one
+    /// across a recursive cycle.
+    const Error = error{
+        OutOfMemory,
+        Overflow,
+        InvalidCharacter,
+        UnexpectedToken,
+        UnexpectedEof,
+        UndefinedVariable,
+        UnknownType,
+        TypeMismatch,
+        InvalidExpression,
+        ExpectedExpression,
+        UnmatchedParenthesis,
+        UnsupportedOperator,
+    };
+
+    fn compileProgram(self: *Compiler) Error!void {
+        while (true) {
+            const token = self.next();
+            if (token.tag == .eof) return;
+            try self.compileStatement(token);
+        }
+    }
+
+    /// Statements between `{` (already consumed) and the matching `}`.
+    fn compileBlock(self: *Compiler) Error!void {
         while (true) {
             const token = self.next();
             switch (token.tag) {
-                .eof => return,
-                .keyword_let => try self.compileLet(),
-                .identifier => {
-                    if (std.mem.eql(u8, token.getValue(self.src), "print")) {
-                        try self.compilePrint();
-                    } else {
-                        return error.UnexpectedToken;
-                    }
-                },
+                .r_brace => return,
+                .eof => return error.UnexpectedEof,
+                else => try self.compileStatement(token),
+            }
+        }
+    }
+
+    fn compileStatement(self: *Compiler, token: Token) Error!void {
+        switch (token.tag) {
+            .keyword_let => try self.compileLet(),
+            .keyword_if => try self.compileIf(),
+            .keyword_while => try self.compileWhile(),
+            .identifier => {
+                const name = token.getValue(self.src);
+                if (std.mem.eql(u8, name, "print")) {
+                    try self.compilePrint();
+                } else {
+                    try self.compileAssign(name);
+                }
+            },
+            else => return error.UnexpectedToken,
+        }
+    }
+
+    /// if ( cond ) { ... } [ else { ... } | else if ... ]
+    ///
+    /// Single-pass backpatching, no AST:
+    ///   <cond>  jump_if_false ELSE  <then>  [jump END]  ELSE: [<else>]  END:
+    fn compileIf(self: *Compiler) Error!void {
+        try self.compileCondition();
+        const jif = self.instructions.items.len;
+        try self.emit(.{ .jump_if_false = instruction_mod.unresolved });
+
+        _ = try self.expect(.l_brace);
+        try self.compileBlock();
+
+        const after = self.next();
+        if (after.tag == .keyword_else) {
+            const jmp = self.instructions.items.len;
+            try self.emit(.{ .jump = instruction_mod.unresolved });
+            self.patch(jif, self.instructions.items.len);
+
+            const branch = self.next();
+            switch (branch.tag) {
+                .l_brace => try self.compileBlock(),
+                .keyword_if => try self.compileIf(), // else if chain
                 else => return error.UnexpectedToken,
             }
+            self.patch(jmp, self.instructions.items.len);
+        } else {
+            self.peeked = after; // not ours; push it back
+            self.patch(jif, self.instructions.items.len);
+        }
+    }
+
+    /// while ( cond ) { ... }
+    ///
+    ///   START: <cond>  jump_if_false END  <body>  jump START  END:
+    fn compileWhile(self: *Compiler) Error!void {
+        const loop_start = self.instructions.items.len;
+        try self.compileCondition();
+        const jif = self.instructions.items.len;
+        try self.emit(.{ .jump_if_false = instruction_mod.unresolved });
+
+        _ = try self.expect(.l_brace);
+        try self.compileBlock();
+
+        try self.emit(.{ .jump = loop_start });
+        self.patch(jif, self.instructions.items.len);
+    }
+
+    /// ( expr ) — the condition must be statically bool.
+    fn compileCondition(self: *Compiler) Error!void {
+        _ = try self.expect(.l_paren);
+        const cond_type = try self.compileExpression(.r_paren);
+        if (cond_type != .bool) return error.TypeMismatch;
+    }
+
+    /// name = expr ;  — assignment to an already-declared variable.
+    /// The variable keeps its declared type; the expression must be
+    /// statically coercible to it.
+    fn compileAssign(self: *Compiler, name: []const u8) Error!void {
+        const info = self.var_types.get(name) orelse return error.UndefinedVariable;
+        _ = try self.expect(.equal);
+        const expr_type = try self.compileExpression(.semicolon);
+        if (!value_mod.canCoerce(expr_type, info.type)) return error.TypeMismatch;
+        try self.emit(.{ .store = .{ .name = name, .slot = info.slot, .type = info.type } });
+        self.traceStore(name, info.type, expr_type, "assigned");
+    }
+
+    /// Resolve a placeholder jump target to `target`.
+    fn patch(self: *Compiler, index: usize, target: usize) void {
+        switch (self.instructions.items[index]) {
+            .jump, .jump_if_false => |*t| t.* = target,
+            else => unreachable,
+        }
+        if (self.trace) {
+            std.debug.print("  (patch @{d} -> {d})\n", .{ index, target });
         }
     }
 
@@ -105,9 +220,7 @@ const Compiler = struct {
 
         const expr_type = try self.compileExpression(.semicolon);
         if (declared_type) |t| {
-            // static check: float never fits an int annotation; int narrowing
-            // stays a runtime range check on the actual value
-            if (expr_type == .f64 and t != .f64) return error.TypeMismatch;
+            if (!value_mod.canCoerce(expr_type, t)) return error.TypeMismatch;
         }
         const var_type = declared_type orelse expr_type;
         // redeclaration reuses the slot and just updates the static type
@@ -118,18 +231,22 @@ const Compiler = struct {
         }
         gop.value_ptr.type = var_type;
         try self.emit(.{ .store = .{ .name = name, .slot = gop.value_ptr.slot, .type = var_type } });
-        if (self.trace) {
-            if (declared_type) |t| {
-                if (t == expr_type) {
-                    std.debug.print("  => {s}: {s} (declared, expression matches)\n", .{ name, @tagName(t) });
-                } else if (value_mod.unify(expr_type, t) == t) {
-                    std.debug.print("  => {s}: {s} (declared, {s} expression widened)\n", .{ name, @tagName(t), @tagName(expr_type) });
-                } else {
-                    std.debug.print("  => {s}: {s} (declared, {s} expression narrowed at runtime, range-checked)\n", .{ name, @tagName(t), @tagName(expr_type) });
-                }
-            } else {
-                std.debug.print("  => {s}: {s} (inferred)\n", .{ name, @tagName(expr_type) });
-            }
+        if (declared_type != null) {
+            self.traceStore(name, var_type, expr_type, "declared");
+        } else if (self.trace) {
+            std.debug.print("  => {s}: {s} (inferred)\n", .{ name, @tagName(expr_type) });
+        }
+    }
+
+    /// Trace verdict for a store into a variable of known type.
+    fn traceStore(self: *Compiler, name: []const u8, var_type: value_mod.Type, expr_type: value_mod.Type, comptime origin: []const u8) void {
+        if (!self.trace) return;
+        if (var_type == expr_type) {
+            std.debug.print("  => {s}: {s} (" ++ origin ++ ", expression matches)\n", .{ name, @tagName(var_type) });
+        } else if (value_mod.unify(expr_type, var_type) == var_type) {
+            std.debug.print("  => {s}: {s} (" ++ origin ++ ", {s} expression widened)\n", .{ name, @tagName(var_type), @tagName(expr_type) });
+        } else {
+            std.debug.print("  => {s}: {s} (" ++ origin ++ ", {s} expression narrowed at runtime, range-checked)\n", .{ name, @tagName(var_type), @tagName(expr_type) });
         }
     }
 
@@ -187,7 +304,18 @@ const Compiler = struct {
                     try self.emit(.{ .load = .{ .name = name, .slot = info.slot, .type = info.type } });
                     emitted_anything = true;
                 },
-                .plus, .minus, .multiply, .divide, .caret => {
+                .plus,
+                .minus,
+                .multiply,
+                .divide,
+                .caret,
+                .equal_equal,
+                .not_equal,
+                .less_than,
+                .greater_than,
+                .less_equal,
+                .greater_equal,
+                => {
                     const prec = getPrecedence(token.tag);
                     while (op_stack.items.len > 0) {
                         const top = op_stack.items[op_stack.items.len - 1];
@@ -237,20 +365,35 @@ const Compiler = struct {
     }
 
     fn emitOperator(self: *Compiler, tag: Token.Tag) !void {
-        // statically mirror the VM's binary op: pop two, push unified type
+        // statically mirror the VM's binary op: pop two operand types,
+        // push the result type
         const rhs = self.type_stack.pop() orelse return error.InvalidExpression;
         const lhs = self.type_stack.pop() orelse return error.InvalidExpression;
+        // no arithmetic or ordering on bools (rules out chained comparisons
+        // like `1 < 2 < 3` as well)
+        if (lhs == .bool or rhs == .bool) return error.TypeMismatch;
         const t = value_mod.unify(lhs, rhs);
-        try self.type_stack.append(self.allocator, t);
 
-        try self.emit(switch (tag) {
+        const inst: Instruction = switch (tag) {
             .plus => .{ .add = t },
             .minus => .{ .sub = t },
             .multiply => .{ .mul = t },
             .divide => .{ .div = t },
             .caret => .{ .pow = t },
+            .equal_equal => .{ .eq = t },
+            .not_equal => .{ .ne = t },
+            .less_than => .{ .lt = t },
+            .greater_than => .{ .gt = t },
+            .less_equal => .{ .le = t },
+            .greater_equal => .{ .ge = t },
             else => return error.UnsupportedOperator,
-        });
+        };
+        const result_type: value_mod.Type = switch (tag) {
+            .equal_equal, .not_equal, .less_than, .greater_than, .less_equal, .greater_equal => .bool,
+            else => t,
+        };
+        try self.type_stack.append(self.allocator, result_type);
+        try self.emit(inst);
     }
 
     fn emit(self: *Compiler, inst: Instruction) !void {
@@ -427,6 +570,175 @@ test "static inference tracks variables across statements" {
     try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x:i8 = 1; let y:i64 = x + 1.5;"));
     // redeclaration updates the static type
     try interpretCapture("let x = 1; let x = 1.5; let y:f64 = x; print(y);", "1.5\n");
+}
+
+// ── control flow ───────────────────────────────────────────────────
+
+test "if executes the taken branch only" {
+    try interpretCapture("if (1 < 2) { print(1); }", "1\n");
+    try interpretCapture("if (2 < 1) { print(1); }", "");
+    try interpretCapture("if (1 < 2) { print(1); } else { print(2); }", "1\n");
+    try interpretCapture("if (2 < 1) { print(1); } else { print(2); }", "2\n");
+}
+
+test "else if chain" {
+    const src =
+        \\let score = 42;
+        \\if (score > 50) { print(1); }
+        \\else if (score > 40) { print(2); }
+        \\else { print(3); }
+    ;
+    try interpretCapture(src, "2\n");
+}
+
+test "if/else bytecode shape and jump targets" {
+    const allocator = std.testing.allocator;
+    const program = try compile(allocator, "if (1 < 2) { print(3); } else { print(4); } print(5);");
+    defer allocator.free(program);
+
+    // 0..2 cond, 3 jif -> else, 4..5 then, 6 jump -> end, 7..8 else, 9.. after
+    try std.testing.expectEqual(Instruction{ .lt = .i64 }, program[2]);
+    try std.testing.expectEqual(Instruction{ .jump_if_false = 7 }, program[3]);
+    try std.testing.expectEqual(Instruction{ .jump = 9 }, program[6]);
+}
+
+test "while counts up" {
+    const src =
+        \\let i = 0;
+        \\while (i < 3) {
+        \\    print(i);
+        \\    i = i + 1;
+        \\}
+        \\print(100);
+    ;
+    try interpretCapture(src, "0\n1\n2\n100\n");
+}
+
+test "while bytecode shape: back-edge and exit target" {
+    const allocator = std.testing.allocator;
+    const program = try compile(allocator, "let i = 0; while (i < 2) { i = i + 1; }");
+    defer allocator.free(program);
+
+    // 0..1 let, 2..4 cond, 5 jif -> 11 (exit), 6..9 body, 10 jump -> 2 (cond)
+    try std.testing.expectEqual(Instruction{ .jump_if_false = 11 }, program[5]);
+    try std.testing.expectEqual(Instruction{ .jump = 2 }, program[10]);
+    try std.testing.expectEqual(@as(usize, 11), program.len);
+}
+
+test "while that never runs" {
+    try interpretCapture("while (1 > 2) { print(1); } print(2);", "2\n");
+}
+
+test "nested control flow" {
+    const src =
+        \\let i = 0;
+        \\while (i < 4) {
+        \\    if (i == 2) { print(i); } else { print(0 - i); }
+        \\    i = i + 1;
+        \\}
+    ;
+    try interpretCapture(src, "0\n-1\n2\n-3\n");
+}
+
+test "fibonacci" {
+    const src =
+        \\let n = 10;
+        \\let a = 0;
+        \\let b = 1;
+        \\let i = 0;
+        \\while (i < n) {
+        \\    let t = a + b;
+        \\    a = b;
+        \\    b = t;
+        \\    i = i + 1;
+        \\}
+        \\print(a);
+    ;
+    try interpretCapture(src, "55\n");
+}
+
+// ── booleans and comparisons ───────────────────────────────────────
+
+test "print comparison result" {
+    try interpretCapture("print(1 < 2);", "true\n");
+    try interpretCapture("print(1 == 2);", "false\n");
+    try interpretCapture("print(1.5 >= 1.5);", "true\n");
+    try interpretCapture("print(1 != 2);", "true\n");
+}
+
+test "comparison unifies operand types" {
+    const allocator = std.testing.allocator;
+    const program = try compile(allocator, "let b = 1:i8 < 2.5;");
+    defer allocator.free(program);
+
+    try std.testing.expectEqual(Instruction{ .lt = .f64 }, program[2]);
+    try std.testing.expectEqual(value_mod.Type.bool, program[3].store.type);
+}
+
+test "bool variables and annotation" {
+    try interpretCapture("let b:bool = 1 < 2; if (b) { print(1); }", "1\n");
+    try interpretCapture("let b = 2 < 1; if (b) { print(1); } else { print(2); }", "2\n");
+}
+
+test "comparisons have lower precedence than arithmetic" {
+    try interpretCapture("print(1 + 2 < 4);", "true\n");
+    try interpretCapture("print(2 * 3 == 6);", "true\n");
+}
+
+// ── assignment ─────────────────────────────────────────────────────
+
+test "assignment keeps the declared type" {
+    // i8 variable assigned an i64 expression: coerced (checked) at runtime
+    try interpretCapture("let x:i8 = 0; x = 100 + 1; print(x);", "101\n");
+}
+
+test "assignment narrows at runtime: overflow" {
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try std.testing.expectError(error.Overflow, interpret(allocator, "let x:i8 = 0; x = 300;", &aw.writer));
+}
+
+test "static error: assignment to undeclared variable" {
+    try std.testing.expectError(error.UndefinedVariable, compile(std.testing.allocator, "x = 5;"));
+}
+
+test "static error: float assigned to int variable" {
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = 1; x = 1.5;"));
+}
+
+// ── static control-flow errors ─────────────────────────────────────
+
+test "static error: non-bool condition" {
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "if (1) { }"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "while (1 + 1) { }"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = 1; if (x) { }"));
+}
+
+test "static error: arithmetic on bool" {
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = (1 < 2) + 1;"));
+}
+
+test "static error: chained comparison" {
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = 1 < 2 < 3;"));
+}
+
+test "static error: bool into numeric annotation and vice versa" {
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x:i64 = 1 < 2;"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let b:bool = 1;"));
+}
+
+test "static error: malformed control flow" {
+    // missing braces
+    try std.testing.expectError(error.UnexpectedToken, compile(std.testing.allocator, "if (1 < 2) print(1);"));
+    // missing parens
+    try std.testing.expectError(error.UnexpectedToken, compile(std.testing.allocator, "while 1 < 2 { }"));
+    // unclosed block
+    try std.testing.expectError(error.UnexpectedEof, compile(std.testing.allocator, "if (1 < 2) { print(1);"));
+    // stray else
+    try std.testing.expectError(error.UnexpectedToken, compile(std.testing.allocator, "else { }"));
+    // else without a branch
+    try std.testing.expectError(error.UnexpectedToken, compile(std.testing.allocator, "if (1 < 2) { } else print(1);"));
 }
 
 test "runtime error: overflow on typed let" {

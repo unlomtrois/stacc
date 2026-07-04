@@ -5,3 +5,9 @@ use geometry;
 let p:Point = (3, 0 - 4);
 print(p.manhattan());        # 7
 print(dot(p, (2, 10)));      # 3*2 + -4*10 = -34
+
+add(Point) fn dot(another_point: Point):i64 {
+    return dot(self, another_point);
+}
+
+print(p.dot((2, 10)));       # 3*2 + -4*10 = -34

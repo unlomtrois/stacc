@@ -52,7 +52,7 @@ Checked at compile time: undefined variables and functions, float-into-int annot
 `--verbose` traces the type checker and the backpatcher, then prints the final bytecode:
 
 ```
-$ zig build run -- --verbose examples/fib.stacy
+$ zig build run -- run --verbose examples/fib.stacy
 ── typecheck ──
   i64.load i@3             [i64]
   i64.load n@0             [i64 i64]
@@ -78,14 +78,16 @@ The bytecode is fully typed, in the style of WASM: `i64.const 5`, `i32.add`, `i8
 Requires Zig master (0.17-dev).
 
 ```sh
-zig build test                              # run the test suite
-zig build run -- examples/functions.stacy   # run a program (interpreter)
-zig build run -- --verbose examples/fib.stacy
-zig build run -- --native examples/fib.stacy -o fib   # compile to a native executable
+zig build test                                    # run the test suite
+zig build run -- run examples/functions.stacy     # interpret a program
+zig build run -- run --verbose examples/fib.stacy
+zig build run -- compile examples/fib.stacy -o fib   # compile to a native executable
 ./fib
 ```
 
-`--native` lowers the bytecode to x86-64 assembly (`fib.s`, readable) and assembles/links it with `zig cc`, so no extra toolchain is needed. The typed instructions map directly: `i64.add` becomes an `addq`, `call fact` a real `call` with a real stack frame. Recursive `fib(30)` runs about 200x faster than the interpreter.
+(After `zig build`, the binary is at `zig-out/bin/stacc`, so plain `stacc run file.stacy` / `stacc compile file.stacy` also work.)
+
+`compile` lowers the bytecode to x86-64 assembly and assembles/links it with `zig cc`, so no extra toolchain is needed; it is silent on success and removes the intermediate `.s` unless you pass `--emit-asm`. The typed instructions map directly: `i64.add` becomes an `addq`, `call fact` a real `call` with a real stack frame. Recursive `fib(30)` runs about 200x faster than the interpreter.
 
 The backend does register allocation without ever building an interference graph, in two linear passes. A prescan over the flat bytecode computes each variable's live interval (first to last access, clamped to enclosing loop brackets: anything touched inside a loop is live for the whole loop, so liveness is bracket matching rather than dataflow). Because Stacy declares before use and its control flow is structured, those intervals form an interval graph whose perfect elimination order is declaration order, so greedy assignment to the callee-saved registers is an optimal coloring; when more than five variables overlap, the interval ending furthest is demoted to memory (Belady's rule applied to whole intervals). Expression temporaries need no analysis at all: the shunting yard's stack discipline means virtual stack depth is itself an optimal coloring, so depth indexes a fixed pool of caller-saved registers, with a per-frame fallback to hardware-stack mode for expressions deeper than the pool. Comparisons fuse with the branch that consumes them. The result for a typical counting loop is a body with zero memory accesses:
 

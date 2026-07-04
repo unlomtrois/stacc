@@ -9,8 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 - Build: `zig build`
-- Run: `zig build run -- examples/basic.stacy` (the CLI takes a `.stacy` file path)
-- Compile to native: `zig build run -- --native examples/fib.stacy [-o out]` (writes `<out>.s` + `<out>.runtime.c`, then invokes `zig cc` to produce the executable)
+- Run a program: `zig build run -- run examples/basic.stacy`
+- Compile to native: `zig build run -- compile examples/fib.stacy [-o out] [--emit-asm]` (silent; lowers to `.s`, invokes `zig cc`, removes intermediates unless `--emit-asm`)
+- `--verbose` (both subcommands) traces type checking and dumps the bytecode to stderr
 - Run all tests: `zig build test`
 - Test a single file: `zig test src/vm/vm.zig` (or any other file; tests live inline in source files)
 

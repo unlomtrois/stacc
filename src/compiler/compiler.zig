@@ -102,8 +102,9 @@ const Compiler = struct {
             // stays a runtime range check on the actual value
             if (expr_type == .f64 and t != .f64) return error.TypeMismatch;
         }
-        try self.var_types.put(self.allocator, name, declared_type orelse expr_type);
-        try self.emit(.{ .store = .{ .name = name, .declared_type = declared_type } });
+        const var_type = declared_type orelse expr_type;
+        try self.var_types.put(self.allocator, name, var_type);
+        try self.emit(.{ .store = .{ .name = name, .type = var_type } });
         if (self.trace) {
             if (declared_type) |t| {
                 if (t == expr_type) {
@@ -170,7 +171,7 @@ const Compiler = struct {
                     const name = token.getValue(self.src);
                     const t = self.var_types.get(name) orelse return error.UndefinedVariable;
                     try self.type_stack.append(self.allocator, t);
-                    try self.emit(.{ .load = name });
+                    try self.emit(.{ .load = .{ .name = name, .type = t } });
                     emitted_anything = true;
                 },
                 .plus, .minus, .multiply, .divide, .caret => {
@@ -226,14 +227,15 @@ const Compiler = struct {
         // statically mirror the VM's binary op: pop two, push unified type
         const rhs = self.type_stack.pop() orelse return error.InvalidExpression;
         const lhs = self.type_stack.pop() orelse return error.InvalidExpression;
-        try self.type_stack.append(self.allocator, value_mod.unify(lhs, rhs));
+        const t = value_mod.unify(lhs, rhs);
+        try self.type_stack.append(self.allocator, t);
 
         try self.emit(switch (tag) {
-            .plus => .add,
-            .minus => .sub,
-            .multiply => .mul,
-            .divide => .div,
-            .caret => .pow,
+            .plus => .{ .add = t },
+            .minus => .{ .sub = t },
+            .multiply => .{ .mul = t },
+            .divide => .{ .div = t },
+            .caret => .{ .pow = t },
             else => return error.UnsupportedOperator,
         });
     }
@@ -291,10 +293,10 @@ test "compile let with precedence" {
     try std.testing.expectEqual(Value{ .i64 = 1 }, program[0].push_const);
     try std.testing.expectEqual(Value{ .i64 = 2 }, program[1].push_const);
     try std.testing.expectEqual(Value{ .i64 = 3 }, program[2].push_const);
-    try std.testing.expectEqual(Instruction.mul, program[3]);
-    try std.testing.expectEqual(Instruction.add, program[4]);
+    try std.testing.expectEqual(Instruction{ .mul = .i64 }, program[3]);
+    try std.testing.expectEqual(Instruction{ .add = .i64 }, program[4]);
     try std.testing.expectEqualStrings("x", program[5].store.name);
-    try std.testing.expectEqual(@as(?value_mod.Type, null), program[5].store.declared_type);
+    try std.testing.expectEqual(value_mod.Type.i64, program[5].store.type); // inferred
 }
 
 test "compile typed let carries declared type" {
@@ -302,7 +304,16 @@ test "compile typed let carries declared type" {
     const program = try compile(allocator, "let x:i8 = 5;");
     defer allocator.free(program);
 
-    try std.testing.expectEqual(value_mod.Type.i8, program[1].store.declared_type.?);
+    try std.testing.expectEqual(value_mod.Type.i8, program[1].store.type);
+}
+
+test "operators are typed by unification" {
+    const allocator = std.testing.allocator;
+    const program = try compile(allocator, "let x:i8 = 1; let y = x + 0.5;");
+    defer allocator.free(program);
+
+    try std.testing.expectEqual(Instruction{ .add = .f64 }, program[4]);
+    try std.testing.expectEqual(value_mod.Type.i8, program[2].load.type);
 }
 
 test "end to end: target program" {

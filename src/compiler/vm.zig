@@ -29,18 +29,15 @@ pub const Vm = struct {
         for (program) |inst| {
             switch (inst) {
                 .push_const => |v| try self.stack.append(self.allocator, v),
-                .load => |name| {
-                    const v = self.vars.get(name) orelse return error.UndefinedVariable;
+                .load => |l| {
+                    const v = self.vars.get(l.name) orelse return error.UndefinedVariable;
                     try self.stack.append(self.allocator, v);
                 },
                 .store => |s| {
-                    var v = try self.pop();
-                    if (s.declared_type) |t| {
-                        v = try v.coerce(t);
-                    }
+                    const v = try (try self.pop()).coerce(s.type);
                     try self.vars.put(self.allocator, s.name, v);
                 },
-                .add, .sub, .mul, .div, .pow => try self.binaryOp(inst),
+                inline .add, .sub, .mul, .div, .pow => |t, op| try self.binaryOp(@field(BinOp, @tagName(op)), t),
                 .print => {
                     const v = try self.pop();
                     try v.write(self.writer);
@@ -54,35 +51,36 @@ pub const Vm = struct {
         return self.stack.pop() orelse error.StackUnderflow;
     }
 
-    fn binaryOp(self: *Vm, inst: Instruction) !void {
+    const BinOp = enum { add, sub, mul, div, pow };
+
+    /// The result type `t` comes from the typed instruction (e.g. i32.add),
+    /// resolved statically by the compiler's type checker.
+    fn binaryOp(self: *Vm, comptime op: BinOp, t: Type) !void {
         const rhs = try self.pop();
         const lhs = try self.pop();
-        const result_type = value_mod.unify(lhs.getType(), rhs.getType());
 
-        const result: Value = if (result_type == .f64) blk: {
+        const result: Value = if (t == .f64) blk: {
             const a = lhs.asF64();
             const b = rhs.asF64();
-            break :blk .{ .f64 = switch (inst) {
+            break :blk .{ .f64 = switch (op) {
                 .add => a + b,
                 .sub => a - b,
                 .mul => a * b,
                 .div => if (b == 0) return error.DivisionByZero else a / b,
                 .pow => std.math.pow(f64, a, b),
-                else => unreachable,
             } };
         } else blk: {
             const a = lhs.asI64();
             const b = rhs.asI64();
-            const wide: i64 = switch (inst) {
+            const wide: i64 = switch (op) {
                 .add => a + b,
                 .sub => a - b,
                 .mul => a * b,
                 .div => if (b == 0) return error.DivisionByZero else @divTrunc(a, b),
                 .pow => try std.math.powi(i64, a, b),
-                else => unreachable,
             };
-            // arithmetic runs in i64; narrow back to the unified type checked
-            break :blk try (Value{ .i64 = wide }).coerce(result_type);
+            // arithmetic runs in i64; narrow to the instruction's type checked
+            break :blk try (Value{ .i64 = wide }).coerce(t);
         };
 
         try self.stack.append(self.allocator, result);
@@ -105,7 +103,7 @@ test "arithmetic and print" {
     try runCapture(&.{
         .{ .push_const = .{ .i64 = 5 } },
         .{ .push_const = .{ .i64 = 2 } },
-        .add,
+        .{ .add = .i64 },
         .print,
     }, "7\n");
 }
@@ -113,12 +111,12 @@ test "arithmetic and print" {
 test "store and load roundtrip with annotation" {
     try runCapture(&.{
         .{ .push_const = .{ .i64 = 7 } },
-        .{ .store = .{ .name = "x", .declared_type = .i8 } },
-        .{ .load = "x" },
+        .{ .store = .{ .name = "x", .type = .i8 } },
+        .{ .load = .{ .name = "x", .type = .i8 } },
         .{ .push_const = .{ .i64 = 3 } },
-        .add,
-        .{ .store = .{ .name = "y", .declared_type = null } },
-        .{ .load = "y" },
+        .{ .add = .i64 },
+        .{ .store = .{ .name = "y", .type = .i64 } },
+        .{ .load = .{ .name = "y", .type = .i64 } },
         .print,
     }, "10\n");
 }
@@ -130,7 +128,7 @@ test "undefined variable" {
     var vm = Vm.init(allocator, &aw.writer);
     defer vm.deinit();
 
-    try std.testing.expectError(error.UndefinedVariable, vm.run(&.{.{ .load = "nope" }}));
+    try std.testing.expectError(error.UndefinedVariable, vm.run(&.{.{ .load = .{ .name = "nope", .type = .i64 } }}));
 }
 
 test "overflow on typed store" {
@@ -142,7 +140,7 @@ test "overflow on typed store" {
 
     try std.testing.expectError(error.Overflow, vm.run(&.{
         .{ .push_const = .{ .i64 = 300 } },
-        .{ .store = .{ .name = "x", .declared_type = .i8 } },
+        .{ .store = .{ .name = "x", .type = .i8 } },
     }));
 }
 
@@ -156,7 +154,7 @@ test "division by zero" {
     try std.testing.expectError(error.DivisionByZero, vm.run(&.{
         .{ .push_const = .{ .i64 = 1 } },
         .{ .push_const = .{ .i64 = 0 } },
-        .div,
+        .{ .div = .i64 },
     }));
 }
 
@@ -164,7 +162,7 @@ test "float arithmetic" {
     try runCapture(&.{
         .{ .push_const = .{ .f64 = 1.5 } },
         .{ .push_const = .{ .i64 = 2 } },
-        .mul,
+        .{ .mul = .f64 },
         .print,
     }, "3\n");
 }

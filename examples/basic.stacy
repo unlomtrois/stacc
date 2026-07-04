@@ -1,4 +1,4 @@
 # basic typed let + print
 let x:i8 = 5 + 2;
-let y = x + 3;
+let y = x + 3:i32; # typed literal; y infers the wider type
 print(y);

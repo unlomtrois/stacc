@@ -41,6 +41,8 @@ const Compiler = struct {
     src: []const u8,
     lexer: Lexer,
     instructions: std.ArrayList(Instruction),
+    /// one-token pushback buffer, filled by peeking past a literal
+    peeked: ?Token = null,
 
     fn compileProgram(self: *Compiler) !void {
         while (true) {
@@ -101,10 +103,22 @@ const Compiler = struct {
             switch (token.tag) {
                 .literal_number => {
                     const text = token.getValue(self.src);
-                    const v: Value = if (std.mem.indexOfScalar(u8, text, '.') != null)
+                    var v: Value = if (std.mem.indexOfScalar(u8, text, '.') != null)
                         .{ .f64 = try std.fmt.parseFloat(f64, text) }
                     else
                         .{ .i64 = try std.fmt.parseInt(i64, text, 10) };
+
+                    // optional literal type annotation: 5:i8
+                    const after = self.next();
+                    if (after.tag == .colon) {
+                        const type_token = try self.expect(.identifier);
+                        const t = value_mod.type_names.get(type_token.getValue(self.src)) orelse
+                            return error.UnknownType;
+                        v = try v.coerce(t);
+                    } else {
+                        self.peeked = after;
+                    }
+
                     try self.emit(.{ .push_const = v });
                     emitted_anything = true;
                 },
@@ -171,6 +185,10 @@ const Compiler = struct {
     }
 
     fn next(self: *Compiler) Token {
+        if (self.peeked) |token| {
+            self.peeked = null;
+            return token;
+        }
         return self.lexer.next() orelse Token{
             .start = self.src.len,
             .end = self.src.len,
@@ -237,6 +255,33 @@ test "end to end: floats" {
 
 test "end to end: print inner parens" {
     try interpretCapture("print((2 + 2) * 2);", "8\n");
+}
+
+test "typed literals" {
+    const allocator = std.testing.allocator;
+    const program = try compile(allocator, "let x = 5:i8;");
+    defer allocator.free(program);
+    try std.testing.expectEqual(Value{ .i8 = 5 }, program[0].push_const);
+
+    try interpretCapture("let x = 5:i8 + 2; print(x);", "7\n");
+    try interpretCapture("print(2:f64 / 8);", "0.25\n"); // typed literal forces float division
+    try interpretCapture("print((1 + 2:i8) * 3:i32);", "9\n");
+}
+
+test "error: annotation only allowed on literals" {
+    try std.testing.expectError(error.UnsupportedOperator, compile(std.testing.allocator, "let x = (1 + 2):i8;"));
+}
+
+test "error: typed literal out of range" {
+    try std.testing.expectError(error.Overflow, compile(std.testing.allocator, "let x = 300:i8;"));
+}
+
+test "error: float literal typed as int" {
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = 5.5:i32;"));
+}
+
+test "error: unknown literal type" {
+    try std.testing.expectError(error.UnknownType, compile(std.testing.allocator, "let x = 5:u7;"));
 }
 
 test "error: unknown type" {

@@ -1,0 +1,5 @@
+# this program does NOT compile — the typechecker rejects it:
+# a f64 expression cannot be bound to an int annotation
+let f = 1.5;
+let x:i32 = f + 1;         # error.TypeMismatch at compile time
+print(x);

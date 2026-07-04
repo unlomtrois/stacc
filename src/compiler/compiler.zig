@@ -14,11 +14,21 @@ pub const Vm = @import("vm.zig").Vm;
 /// Compile source into a flat instruction list. Variable names in the
 /// returned instructions are slices into `src`.
 pub fn compile(allocator: std.mem.Allocator, src: []const u8) ![]Instruction {
+    return compileInner(allocator, src, false);
+}
+
+/// Like `compile`, but traces type checking to stderr as it emits.
+pub fn compileVerbose(allocator: std.mem.Allocator, src: []const u8) ![]Instruction {
+    return compileInner(allocator, src, true);
+}
+
+fn compileInner(allocator: std.mem.Allocator, src: []const u8, trace: bool) ![]Instruction {
     var compiler = Compiler{
         .allocator = allocator,
         .src = src,
         .lexer = try Lexer.init(src),
         .instructions = .empty,
+        .trace = trace,
     };
     errdefer compiler.instructions.deinit(allocator);
     defer compiler.type_stack.deinit(allocator);
@@ -50,6 +60,8 @@ const Compiler = struct {
     type_stack: std.ArrayList(value_mod.Type) = .empty,
     /// static types of declared variables
     var_types: std.StringHashMapUnmanaged(value_mod.Type) = .empty,
+    /// print type-checking steps to stderr while compiling
+    trace: bool = false,
 
     fn compileProgram(self: *Compiler) !void {
         while (true) {
@@ -92,6 +104,19 @@ const Compiler = struct {
         }
         try self.var_types.put(self.allocator, name, declared_type orelse expr_type);
         try self.emit(.{ .store = .{ .name = name, .declared_type = declared_type } });
+        if (self.trace) {
+            if (declared_type) |t| {
+                if (t == expr_type) {
+                    std.debug.print("  => {s}: {s} (declared, expression matches)\n", .{ name, @tagName(t) });
+                } else if (value_mod.unify(expr_type, t) == t) {
+                    std.debug.print("  => {s}: {s} (declared, {s} expression widened)\n", .{ name, @tagName(t), @tagName(expr_type) });
+                } else {
+                    std.debug.print("  => {s}: {s} (declared, {s} expression narrowed at runtime, range-checked)\n", .{ name, @tagName(t), @tagName(expr_type) });
+                }
+            } else {
+                std.debug.print("  => {s}: {s} (inferred)\n", .{ name, @tagName(expr_type) });
+            }
+        }
     }
 
     /// print ( expr ) ;  — the identifier "print" is already consumed
@@ -137,15 +162,15 @@ const Compiler = struct {
                         self.peeked = after;
                     }
 
-                    try self.emit(.{ .push_const = v });
                     try self.type_stack.append(self.allocator, v.getType());
+                    try self.emit(.{ .push_const = v });
                     emitted_anything = true;
                 },
                 .identifier => {
                     const name = token.getValue(self.src);
                     const t = self.var_types.get(name) orelse return error.UndefinedVariable;
-                    try self.emit(.{ .load = name });
                     try self.type_stack.append(self.allocator, t);
+                    try self.emit(.{ .load = name });
                     emitted_anything = true;
                 },
                 .plus, .minus, .multiply, .divide, .caret => {
@@ -215,6 +240,16 @@ const Compiler = struct {
 
     fn emit(self: *Compiler, inst: Instruction) !void {
         try self.instructions.append(self.allocator, inst);
+        if (self.trace) {
+            var buf: [128]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{f}", .{inst}) catch buf[0..];
+            std.debug.print("  {s:<24} [", .{text});
+            for (self.type_stack.items, 0..) |t, i| {
+                if (i > 0) std.debug.print(" ", .{});
+                std.debug.print("{s}", .{@tagName(t)});
+            }
+            std.debug.print("]\n", .{});
+        }
     }
 
     fn next(self: *Compiler) Token {

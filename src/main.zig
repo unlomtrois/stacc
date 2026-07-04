@@ -27,7 +27,10 @@ pub fn main(init: std.process.Init) !void {
 
     const src = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20));
 
-    const program = try stacc.compiler.compile(allocator, src);
+    const program = if (verbose) blk: {
+        std.debug.print("── typecheck ──\n", .{});
+        break :blk try stacc.compiler.compileVerbose(allocator, src);
+    } else try stacc.compiler.compile(allocator, src);
 
     if (verbose) {
         std.debug.print("── compiled {d} instructions ──\n", .{program.len});

@@ -1,0 +1,9 @@
+# types flow across statements via the compile-time type stack
+let x:i8 = 1;
+let y:i32 = 100;
+let wide = x + y;          # i8 + i32 unifies to i32
+let f = wide + 0.5;        # mixing with a float infers f64
+let back:f64 = x;          # int widens into a float annotation
+print(wide);
+print(f);
+print(back);

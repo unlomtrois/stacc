@@ -1,0 +1,8 @@
+# shunting yard handles precedence, parens, and right-assoc ^
+let a = 3 + 4 * 2;         # 11, not 14
+let b = (3 + 4) * 2;       # 14
+let c = 2 ^ 3 ^ 2;         # 512: ^ is right-associative
+print(a);
+print(b);
+print(c);
+print(a * b - c);

@@ -1,0 +1,5 @@
+# literals default to i64, but can be annotated
+let small = 5:i8 + 2:i8;   # stays i8 all the way
+let ratio = 2:f64 / 8;     # typed literal promotes the division to float
+print(small);
+print(ratio);

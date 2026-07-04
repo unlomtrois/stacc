@@ -9,7 +9,7 @@ const isLeftAssoc = shunting_yard.isLeftAssoc;
 const value_mod = @import("value.zig");
 const Value = value_mod.Value;
 const instruction_mod = @import("instruction.zig");
-const Instruction = instruction_mod.Instruction;
+pub const Instruction = instruction_mod.Instruction;
 pub const Vm = @import("vm.zig").Vm;
 
 /// Compile source into a flat instruction list. Variable names in the
@@ -250,6 +250,7 @@ const Compiler = struct {
         try self.emit(.{ .jump = instruction_mod.unresolved });
 
         const entry = self.instructions.items.len;
+        const num_params: u32 = @intCast(params.items.len);
         try self.fn_table.put(self.allocator, name, .{
             .entry = entry,
             .params = try params.toOwnedSlice(self.allocator),
@@ -260,6 +261,14 @@ const Compiler = struct {
         if (self.trace) {
             std.debug.print("── fn {s} @{d} ──\n", .{ name, entry });
         }
+        // frame-shape marker for native codegen (a VM no-op); its
+        // num_slots is patched below, together with the recursive calls
+        try self.emit(.{ .fn_prologue = .{
+            .name = name,
+            .num_params = num_params,
+            .num_slots = 0,
+            .returns_value = return_type != null,
+        } });
 
         self.in_function = true;
         self.current_return_type = return_type;
@@ -269,15 +278,16 @@ const Compiler = struct {
         // implicit end of body: void functions return, value-returning
         // ones trap (all successful paths must have hit a return)
         if (return_type == null) {
-            try self.emit(.ret);
+            try self.emit(.{ .ret = false });
         } else {
             try self.emit(.trap);
         }
 
-        // finalize the frame size; patch recursive call sites
+        // finalize the frame size; patch the prologue and recursive call sites
         const info = self.fn_table.getPtr(name).?;
         info.num_slots = self.next_slot;
         info.finalized = true;
+        self.instructions.items[entry].fn_prologue.num_slots = info.num_slots;
         for (self.pending_calls.items) |index| {
             self.instructions.items[index].call.num_slots = info.num_slots;
             if (self.trace) {
@@ -302,7 +312,7 @@ const Compiler = struct {
         const token = self.next();
         if (token.tag == .semicolon) {
             if (self.current_return_type != null) return error.TypeMismatch; // must return a value
-            try self.emit(.ret);
+            try self.emit(.{ .ret = false });
             return;
         }
         self.peeked = token;
@@ -317,7 +327,7 @@ const Compiler = struct {
             try self.emit(.{ .convert = return_type });
         }
         _ = self.type_stack.pop();
-        try self.emit(.ret);
+        try self.emit(.{ .ret = true });
     }
 
     /// name(arg, ...) — the name and `(` are already consumed. Emits the
@@ -360,6 +370,7 @@ const Compiler = struct {
             .target = info.entry,
             .num_params = @intCast(info.params.len),
             .num_slots = info.num_slots,
+            .returns_value = info.return_type != null,
         } });
         if (!info.finalized) {
             try self.pending_calls.append(self.allocator, call_index);
@@ -430,6 +441,7 @@ const Compiler = struct {
         _ = try self.expect(.equal);
         const expr_type = try self.compileExpression(.semicolon);
         if (!value_mod.canCoerce(expr_type, info.type)) return error.TypeMismatch;
+        try self.emitConvertTo(expr_type, info.type);
         _ = self.type_stack.pop(); // the store consumes the expression value
         try self.emit(.{ .store = .{ .name = name, .slot = info.slot, .type = info.type } });
         self.traceStore(name, info.type, expr_type, "assigned");
@@ -473,6 +485,7 @@ const Compiler = struct {
             self.next_slot += 1;
         }
         gop.value_ptr.type = var_type;
+        try self.emitConvertTo(expr_type, var_type);
         _ = self.type_stack.pop(); // the store consumes the expression value
         try self.emit(.{ .store = .{ .name = name, .slot = gop.value_ptr.slot, .type = var_type } });
         if (declared_type != null) {
@@ -480,6 +493,14 @@ const Compiler = struct {
         } else if (self.trace) {
             std.debug.print("  => {s}: {s} (inferred)\n", .{ name, @tagName(expr_type) });
         }
+    }
+
+    /// Emit a convert making the runtime top-of-stack match `target`.
+    /// The caller has already established coercibility.
+    fn emitConvertTo(self: *Compiler, from: value_mod.Type, target: value_mod.Type) Error!void {
+        if (from == target) return;
+        self.type_stack.items[self.type_stack.items.len - 1] = target;
+        try self.emit(.{ .convert = target });
     }
 
     /// Trace verdict for a store into a variable of known type.
@@ -496,10 +517,10 @@ const Compiler = struct {
 
     /// print ( expr ) ;  — "print" and `(` are already consumed
     fn compilePrint(self: *Compiler) Error!void {
-        _ = try self.compileExpression(.r_paren);
+        const expr_type = try self.compileExpression(.r_paren);
         _ = try self.expect(.semicolon);
         _ = self.type_stack.pop(); // print consumes the expression value
-        try self.emit(.print);
+        try self.emit(.{ .print = expr_type });
     }
 
     /// Shunting-yard over one expression, emitting instructions in RPN
@@ -637,12 +658,29 @@ const Compiler = struct {
     fn emitOperator(self: *Compiler, tag: Token.Tag) !void {
         // statically mirror the VM's binary op: pop two operand types,
         // push the result type
-        const rhs = self.type_stack.pop() orelse return error.InvalidExpression;
-        const lhs = self.type_stack.pop() orelse return error.InvalidExpression;
+        if (self.type_stack.items.len < 2) return error.InvalidExpression;
+        const items = self.type_stack.items;
+        var rhs = items[items.len - 1];
+        var lhs = items[items.len - 2];
         // no arithmetic or ordering on bools (rules out chained comparisons
         // like `1 < 2 < 3` as well)
         if (lhs == .bool or rhs == .bool) return error.TypeMismatch;
         const t = value_mod.unify(lhs, rhs);
+
+        // ints widen for free at runtime, but int -> f64 changes the bit
+        // representation, so native code needs it spelled out
+        if (t == .f64 and rhs != .f64) {
+            self.type_stack.items[items.len - 1] = .f64;
+            rhs = .f64;
+            try self.emit(.{ .convert = .f64 });
+        }
+        if (t == .f64 and lhs != .f64) {
+            self.type_stack.items[items.len - 2] = .f64;
+            lhs = .f64;
+            try self.emit(.{ .convert_under = .f64 });
+        }
+        _ = self.type_stack.pop();
+        _ = self.type_stack.pop();
 
         const inst: Instruction = switch (tag) {
             .plus => .{ .add = t },
@@ -732,7 +770,9 @@ test "compile typed let carries declared type" {
     const program = try compile(allocator, "let x:i8 = 5;");
     defer allocator.free(program);
 
-    try std.testing.expectEqual(value_mod.Type.i8, program[2].store.type);
+    // 0 enter, 1 const (i64), 2 convert i8, 3 store
+    try std.testing.expectEqual(Instruction{ .convert = .i8 }, program[2]);
+    try std.testing.expectEqual(value_mod.Type.i8, program[3].store.type);
 }
 
 test "operators are typed by unification" {
@@ -740,8 +780,10 @@ test "operators are typed by unification" {
     const program = try compile(allocator, "let x:i8 = 1; let y = x + 0.5;");
     defer allocator.free(program);
 
-    try std.testing.expectEqual(Instruction{ .add = .f64 }, program[5]);
-    try std.testing.expectEqual(value_mod.Type.i8, program[3].load.type);
+    // 4 load x (i8), 5 const 0.5, 6 convert_under f64 (int lhs), 7 f64.add
+    try std.testing.expectEqual(value_mod.Type.i8, program[4].load.type);
+    try std.testing.expectEqual(Instruction{ .convert_under = .f64 }, program[6]);
+    try std.testing.expectEqual(Instruction{ .add = .f64 }, program[7]);
 }
 
 test "end to end: target program" {
@@ -943,8 +985,10 @@ test "comparison unifies operand types" {
     const program = try compile(allocator, "let b = 1:i8 < 2.5;");
     defer allocator.free(program);
 
-    try std.testing.expectEqual(Instruction{ .lt = .f64 }, program[3]);
-    try std.testing.expectEqual(value_mod.Type.bool, program[4].store.type);
+    // 1 const 1:i8, 2 const 2.5, 3 convert_under f64 (int lhs), 4 f64.lt
+    try std.testing.expectEqual(Instruction{ .convert_under = .f64 }, program[3]);
+    try std.testing.expectEqual(Instruction{ .lt = .f64 }, program[4]);
+    try std.testing.expectEqual(value_mod.Type.bool, program[5].store.type);
 }
 
 test "bool variables and annotation" {

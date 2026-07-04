@@ -54,6 +54,7 @@ pub const Vm = struct {
                     self.slots.items[self.slot_base + s.slot] = v;
                 },
                 .enter => |n| try self.slots.appendNTimes(self.allocator, .{ .i64 = 0 }, n),
+                .fn_prologue => {}, // frame setup is done by .call; native codegen uses this
                 .call => |c| {
                     if (self.frames.items.len >= max_call_depth) return error.StackOverflow;
                     const new_base = self.slots.items.len;
@@ -81,6 +82,11 @@ pub const Vm = struct {
                     const v = try (try self.pop()).coerce(t);
                     try self.stack.append(self.allocator, v);
                 },
+                .convert_under => |t| {
+                    if (self.stack.items.len < 2) return error.StackUnderflow;
+                    const index = self.stack.items.len - 2;
+                    self.stack.items[index] = try self.stack.items[index].coerce(t);
+                },
                 inline .add, .sub, .mul, .div, .pow => |t, op| try self.binaryOp(@field(BinOp, @tagName(op)), t),
                 inline .eq, .ne, .lt, .gt, .le, .ge => |t, op| try self.comparisonOp(@field(CmpOp, @tagName(op)), t),
                 .jump => |target| pc = target,
@@ -90,6 +96,8 @@ pub const Vm = struct {
                     if (!v.bool) pc = target;
                 },
                 .print => {
+                    // the static type is for native codegen; the VM's
+                    // values carry their own tags
                     const v = try self.pop();
                     try v.write(self.writer);
                     try self.writer.writeByte('\n');
@@ -197,7 +205,7 @@ test "arithmetic and print" {
         .{ .push_const = .{ .i64 = 5 } },
         .{ .push_const = .{ .i64 = 2 } },
         .{ .add = .i64 },
-        .print,
+        .{ .print = .i64 },
     }, "7\n");
 }
 
@@ -211,7 +219,7 @@ test "store and load roundtrip with annotation" {
         .{ .add = .i64 },
         .{ .store = .{ .name = "y", .slot = 1, .type = .i64 } },
         .{ .load = .{ .name = "y", .slot = 1, .type = .i64 } },
-        .print,
+        .{ .print = .i64 },
     }, "10\n");
 }
 
@@ -248,7 +256,7 @@ test "comparison pushes bool" {
         .{ .push_const = .{ .i64 = 1 } },
         .{ .push_const = .{ .i64 = 2 } },
         .{ .lt = .i64 },
-        .print,
+        .{ .print = .bool },
     }, "true\n");
 }
 
@@ -256,9 +264,9 @@ test "jump skips instructions" {
     try runCapture(&.{
         .{ .jump = 3 },
         .{ .push_const = .{ .i64 = 1 } }, // skipped
-        .print, // skipped
+        .{ .print = .i64 }, // skipped
         .{ .push_const = .{ .i64 = 2 } },
-        .print,
+        .{ .print = .i64 },
     }, "2\n");
 }
 
@@ -267,13 +275,13 @@ test "jump_if_false branches on the popped bool" {
         .{ .push_const = .{ .bool = false } },
         .{ .jump_if_false = 4 },
         .{ .push_const = .{ .i64 = 1 } }, // skipped
-        .print, // skipped
+        .{ .print = .i64 }, // skipped
         .{ .push_const = .{ .i64 = 2 } },
-        .print,
+        .{ .print = .i64 },
         .{ .push_const = .{ .bool = true } },
         .{ .jump_if_false = 11 }, // not taken
         .{ .push_const = .{ .i64 = 3 } },
-        .print,
+        .{ .print = .i64 },
     }, "2\n3\n");
 }
 
@@ -313,10 +321,10 @@ test "call passes args into frame slots and ret resumes" {
         .{ .load = .{ .name = "x", .slot = 0, .type = .i64 } }, // 1: body
         .{ .load = .{ .name = "x", .slot = 0, .type = .i64 } },
         .{ .add = .i64 },
-        .ret,
+        .{ .ret = true },
         .{ .push_const = .{ .i64 = 21 } }, // 5: main
-        .{ .call = .{ .name = "double", .target = 1, .num_params = 1, .num_slots = 1 } },
-        .print,
+        .{ .call = .{ .name = "double", .target = 1, .num_params = 1, .num_slots = 1, .returns_value = true } },
+        .{ .print = .i64 },
     }, "42\n");
 }
 
@@ -327,12 +335,12 @@ test "frames isolate slots across calls" {
         .{ .jump = 5 },
         .{ .push_const = .{ .i64 = 99 } }, // 2: body
         .{ .store = .{ .name = "y", .slot = 0, .type = .i64 } },
-        .ret,
+        .{ .ret = false },
         .{ .push_const = .{ .i64 = 7 } }, // 5: main
         .{ .store = .{ .name = "x", .slot = 0, .type = .i64 } },
-        .{ .call = .{ .name = "f", .target = 2, .num_params = 0, .num_slots = 1 } },
+        .{ .call = .{ .name = "f", .target = 2, .num_params = 0, .num_slots = 1, .returns_value = false } },
         .{ .load = .{ .name = "x", .slot = 0, .type = .i64 } },
-        .print,
+        .{ .print = .i64 },
     }, "7\n");
 }
 
@@ -352,7 +360,7 @@ test "pop discards and convert coerces" {
         .pop,
         .{ .push_const = .{ .i64 = 7 } },
         .{ .convert = .f64 },
-        .print,
+        .{ .print = .f64 },
     }, "7\n");
 }
 
@@ -379,9 +387,9 @@ test "call depth is bounded" {
     // fn f() { f(); }  — infinite recursion
     try std.testing.expectError(error.StackOverflow, vm.run(&.{
         .{ .jump = 3 },
-        .{ .call = .{ .name = "f", .target = 1, .num_params = 0, .num_slots = 0 } }, // 1: body
-        .ret,
-        .{ .call = .{ .name = "f", .target = 1, .num_params = 0, .num_slots = 0 } }, // 3: main
+        .{ .call = .{ .name = "f", .target = 1, .num_params = 0, .num_slots = 0, .returns_value = false } }, // 1: body
+        .{ .ret = false },
+        .{ .call = .{ .name = "f", .target = 1, .num_params = 0, .num_slots = 0, .returns_value = false } }, // 3: main
     }));
 }
 
@@ -390,6 +398,6 @@ test "float arithmetic" {
         .{ .push_const = .{ .f64 = 1.5 } },
         .{ .push_const = .{ .i64 = 2 } },
         .{ .mul = .f64 },
-        .print,
+        .{ .print = .f64 },
     }, "3\n");
 }

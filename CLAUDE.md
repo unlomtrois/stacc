@@ -10,6 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Build: `zig build`
 - Run: `zig build run -- examples/basic.stacy` (the CLI takes a `.stacy` file path)
+- Compile to native: `zig build run -- --native examples/fib.stacy [-o out]` (writes `<out>.s` + `<out>.runtime.c`, then invokes `zig cc` to produce the executable)
 - Run all tests: `zig build test`
 - Test a single file: `zig test src/vm/vm.zig` (or any other file; tests live inline in source files)
 
@@ -27,6 +28,7 @@ There are two coexisting implementations:
    - `compiler/instruction.zig`: instructions are fully typed at compile time (`i32.add`, `i8.store x@0`, `f64.const 0.5` — the arithmetic ops carry a `Type` payload, load/store carry the resolved variable type plus a flat **slot index**; the name is kept only for disassembly). The VM never re-derives types or looks up names.
    - `compiler/vm.zig`: stack VM with a program-counter loop (`jump`/`jump_if_false` set the pc). Variables live in a contiguous slot stack with a frame base pointer: `enter` allocates the top-level frame, `call` pushes a frame (popping args into its leading slots) and `ret` drops it — the return value stays on the value stack. Call depth is capped (`max_call_depth`, `error.StackOverflow`). Integer arithmetic runs in i64 and narrows to the instruction's type (range-checked); int `/` truncates.
    - `parser/shunting_yard.zig`: a standalone **lazy** shunting-yard infix→postfix iterator (`next() !?Token`) driven by an explicit state machine. The compiler reuses its `getPrecedence`/`isLeftAssoc`; `^` is the only right-associative operator.
+   - `compiler/codegen_x86.zig`: AOT native backend lowering the bytecode to x86-64 System V assembly (AT&T syntax), assembled and linked by `zig cc` together with `src/runtime/stacc_runtime.c` (print/powi/pow helpers and noreturn error exits, `stacc_rt_*`). Conventions: every value is a canonical 8-byte quad (ints sign-extended, f64 bit patterns, bool 0/1) — this is why the compiler emits explicit `convert`/`convert_under` instructions wherever the VM used to coerce by runtime tag; slot k is at `-8*(k+1)(%rbp)`; each frame has one hidden scratch slot (index `num_slots`) used to save/realign `%rsp` around C helper calls (internal calls don't need ABI alignment); callee prologue (from `fn_prologue`) copies stack args into its leading slots, caller pops args and pushes `%rax` if a value returns. Bytecode carries codegen-only metadata the VM ignores: `fn_prologue`, `ret: bool`, `print: Type`, `Call.returns_value`. Known divergence: plain i64 arithmetic wraps natively (the VM panics in debug), and native recursion depth is bounded by the real stack, not `max_call_depth`.
 
 `main.stacy` is a design sketch of future syntax (explicit literal casts like `5:i32`) — it does NOT parse with the current compiler; runnable programs live in `examples/`.
 

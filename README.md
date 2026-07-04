@@ -79,9 +79,13 @@ Requires Zig master (0.17-dev).
 
 ```sh
 zig build test                              # run the test suite
-zig build run -- examples/functions.stacy   # run a program
+zig build run -- examples/functions.stacy   # run a program (interpreter)
 zig build run -- --verbose examples/fib.stacy
+zig build run -- --native examples/fib.stacy -o fib   # compile to a native executable
+./fib
 ```
+
+`--native` lowers the bytecode to x86-64 assembly (`fib.s`, readable) and assembles/links it with `zig cc`, so no extra toolchain is needed. The typed instructions map directly: `i64.add` becomes an `addq`, `i8.store x@0` a `popq -8(%rbp)` after a range check, `call fact` a real `call` with a real stack frame. Recursive `fib(30)` runs about 100x faster than the interpreter.
 
 Runnable programs live in `examples/`. (`main.stacy` is an old design sketch, not valid syntax.)
 

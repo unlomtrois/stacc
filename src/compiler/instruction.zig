@@ -33,18 +33,33 @@ pub const Instruction = union(enum) {
     /// allocate the top-level frame (always instruction 0, backpatched
     /// with the final slot count at end of compilation)
     enter: u32,
+    /// marks a function entry; a no-op in the VM, but carries the frame
+    /// shape that native codegen lowers into a prologue. num_slots is
+    /// backpatched when the body finishes compiling.
+    fn_prologue: FnPrologue,
     /// pop the arguments into a fresh frame and jump to the function body
     call: Call,
     /// drop the current frame and resume at the saved pc; a return value,
-    /// if any, stays on the value stack
-    ret,
+    /// if any (`true`), stays on the value stack
+    ret: bool,
     /// falling off the end of a value-returning function
     trap,
     /// discard the top of the value stack (unused call result)
     pop,
     /// pop, coerce to the given type (range-checked), push
     convert: Type,
-    print,
+    /// like convert, but for the value one below the top (left operand
+    /// of a binary op that unified to f64)
+    convert_under: Type,
+    /// pop and print a value of the statically known type
+    print: Type,
+
+    pub const FnPrologue = struct {
+        name: []const u8,
+        num_params: u32,
+        num_slots: u32,
+        returns_value: bool,
+    };
 
     pub const Call = struct {
         /// callee name, kept only for disassembly
@@ -55,6 +70,7 @@ pub const Instruction = union(enum) {
         /// full frame size (params + locals); backpatched for recursive
         /// call sites emitted before the body finished compiling
         num_slots: u32,
+        returns_value: bool,
     };
 
     pub const Load = struct {
@@ -86,13 +102,15 @@ pub const Instruction = union(enum) {
             },
             .load => |l| try writer.print("{s}.load {s}@{d}", .{ @tagName(l.type), l.name, l.slot }),
             .store => |s| try writer.print("{s}.store {s}@{d}", .{ @tagName(s.type), s.name, s.slot }),
-            .print => try writer.writeAll("print"),
+            .print => |t| try writer.print("{s}.print", .{@tagName(t)}),
             .enter => |n| try writer.print("enter {d}", .{n}),
+            .fn_prologue => |f| try writer.print("fn {s} ({d} params, {d} slots)", .{ f.name, f.num_params, f.num_slots }),
             .call => |c| try writer.print("call {s} -> {d} ({d} params, {d} slots)", .{ c.name, c.target, c.num_params, c.num_slots }),
-            .ret => try writer.writeAll("ret"),
+            .ret => |has_value| try writer.writeAll(if (has_value) "ret value" else "ret"),
             .trap => try writer.writeAll("trap"),
             .pop => try writer.writeAll("pop"),
             .convert => |t| try writer.print("{s}.convert", .{@tagName(t)}),
+            .convert_under => |t| try writer.print("{s}.convert_under", .{@tagName(t)}),
             inline .jump, .jump_if_false => |target, op| {
                 if (target == unresolved) {
                     try writer.print("{s} -> ?", .{@tagName(op)});

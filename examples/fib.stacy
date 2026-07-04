@@ -14,16 +14,19 @@ print(fib(40));       # 102334155, ~2^38 recursive calls
 # the largest fibonacci number that fits in i64 is fib(92);
 # computing it recursively would take centuries, so iterate
 fn fib_iter(n:i64):i64 {
+    if (n < 1) {
+        return 0;
+    }
     let a = 0;
     let b = 1;
-    let i = 0;
-    while (i < n) {
+    let i = 1;
+    while (i < n) {   # stops at fib(n): one step further would overflow i64
         let t = a + b;
         a = b;
         b = t;
         i = i + 1;
     }
-    return a;
+    return b;
 }
 
 print(fib_iter(92));  # 7540113804746346429, i64 max is fib(92)

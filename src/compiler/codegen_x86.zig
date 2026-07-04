@@ -323,6 +323,13 @@ fn finalizeRegion(allocator: std.mem.Allocator, builder: *RegionBuilder) !Region
 // ── pass 2: emission ───────────────────────────────────────────────
 
 pub fn emit(allocator: std.mem.Allocator, program: []const Instruction, writer: *std.Io.Writer) !void {
+    var raw = std.Io.Writer.Allocating.init(allocator);
+    defer raw.deinit();
+    try emitRaw(allocator, program, &raw.writer);
+    try peephole(raw.writer.buffered(), writer);
+}
+
+pub fn emitRaw(allocator: std.mem.Allocator, program: []const Instruction, writer: *std.Io.Writer) !void {
     var plan = try analyze(allocator, program);
     defer plan.deinit(allocator);
 
@@ -333,6 +340,127 @@ pub fn emit(allocator: std.mem.Allocator, program: []const Instruction, writer: 
         .region = plan.regions.getPtr(0).?,
     };
     try emitter.run();
+}
+
+// ── pass 3: peephole ───────────────────────────────────────────────
+//
+// A one-line window over the generated text. The only rewrites are
+// ones whose safety follows from how the emitter uses registers:
+// - copy chains `movq A, B; movq B, C` collapse to `movq A, C` when B
+//   is a transient register (value-stack pool, %rax, %r11). Those are
+//   only ever written as staging for the immediately following
+//   instruction, never read twice through moves. Callee-saved
+//   variable registers are never touched: they carry values across
+//   arbitrary code.
+// - adjacent dead stores to a transient register are dropped.
+// - `movabsq` becomes `movq` when the immediate fits 32 bits, and
+//   self-moves disappear.
+
+const Move = struct {
+    src: []const u8,
+    dst: []const u8,
+    comment: []const u8,
+
+    fn parse(line: []const u8) ?Move {
+        const trimmed = std.mem.trimStart(u8, line, " ");
+        const rest = blk: {
+            if (std.mem.startsWith(u8, trimmed, "movq ")) break :blk trimmed["movq ".len..];
+            if (std.mem.startsWith(u8, trimmed, "movabsq ")) break :blk trimmed["movabsq ".len..];
+            return null;
+        };
+        var operands = rest;
+        var comment: []const u8 = "";
+        if (std.mem.indexOf(u8, rest, "#")) |hash| {
+            comment = std.mem.trimEnd(u8, rest[hash + 1 ..], " ");
+            operands = rest[0..hash];
+        }
+        const comma = std.mem.indexOf(u8, operands, ", ") orelse return null;
+        return .{
+            .src = std.mem.trim(u8, operands[0..comma], " "),
+            .dst = std.mem.trim(u8, operands[comma + 2 ..], " "),
+            .comment = std.mem.trim(u8, comment, " "),
+        };
+    }
+
+    fn isMem(operand: []const u8) bool {
+        return std.mem.indexOfScalar(u8, operand, '(') != null;
+    }
+
+    fn isImm(operand: []const u8) bool {
+        return operand.len > 0 and operand[0] == '$';
+    }
+
+    fn immFits32(operand: []const u8) bool {
+        const v = std.fmt.parseInt(i64, operand[1..], 10) catch return false;
+        return v >= std.math.minInt(i32) and v <= std.math.maxInt(i32);
+    }
+
+    /// Registers only ever used to stage a value for the immediately
+    /// following instruction. Variable registers are excluded: they
+    /// hold values across arbitrary spans.
+    fn isTransient(operand: []const u8) bool {
+        const transient = [_][]const u8{ "%rsi", "%rdi", "%r8", "%r9", "%r10", "%r11", "%rax" };
+        for (transient) |reg| {
+            if (std.mem.eql(u8, operand, reg)) return true;
+        }
+        return false;
+    }
+
+    fn canCollapse(first: Move, second: Move) bool {
+        if (!std.mem.eql(u8, first.dst, second.src)) return false;
+        if (!isTransient(first.dst)) return false;
+        // no x86 mem-to-mem moves, no immediates into xmm, and
+        // movabsq-sized immediates only go to registers
+        if (isMem(first.src) and isMem(second.dst)) return false;
+        if (isImm(first.src)) {
+            if (std.mem.startsWith(u8, second.dst, "%xmm")) return false;
+            if (isMem(second.dst) and !immFits32(first.src)) return false;
+        }
+        return true;
+    }
+
+    fn write(self: Move, out: *std.Io.Writer) !void {
+        if (std.mem.eql(u8, self.src, self.dst)) return; // self-move
+        const mnemonic = if (isImm(self.src) and !immFits32(self.src)) "movabsq" else "movq";
+        if (self.comment.len > 0) {
+            try out.print("    {s} {s}, {s}    # {s}\n", .{ mnemonic, self.src, self.dst, self.comment });
+        } else {
+            try out.print("    {s} {s}, {s}\n", .{ mnemonic, self.src, self.dst });
+        }
+    }
+};
+
+pub fn peephole(text: []const u8, out: *std.Io.Writer) !void {
+    var pending: ?Move = null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const move = Move.parse(line) orelse {
+            if (pending) |p| try p.write(out);
+            pending = null;
+            try out.print("{s}\n", .{line});
+            continue;
+        };
+        if (pending) |p| {
+            if (Move.canCollapse(p, move)) {
+                // forward the source through the transient register;
+                // stays pending so longer chains keep collapsing
+                pending = .{
+                    .src = p.src,
+                    .dst = move.dst,
+                    .comment = if (move.comment.len > 0) move.comment else p.comment,
+                };
+                continue;
+            }
+            if (std.mem.eql(u8, p.dst, move.dst) and Move.isTransient(p.dst)) {
+                pending = move; // adjacent dead store: drop the first
+                continue;
+            }
+            try p.write(out);
+        }
+        pending = move;
+    }
+    if (pending) |p| try p.write(out);
 }
 
 const Emitter = struct {
@@ -771,8 +899,13 @@ const Emitter = struct {
                 },
                 .i8, .i32 => {
                     if (reg_mode) {
+                        // write back after the check: pool registers
+                        // must never be read twice through moves
+                        // without an intervening write (the peephole
+                        // relies on it)
                         try w.print("    movq {s}, %rax\n", .{self.top()});
                         try emitNarrowCheck(w, t);
+                        try w.print("    movq %rax, {s}\n", .{self.top()});
                     } else {
                         try w.writeAll("    popq %rax\n");
                         try emitNarrowCheck(w, t);
@@ -1020,6 +1153,119 @@ test "functions get frames and calls flush the pool" {
     try std.testing.expect(std.mem.indexOf(u8, asm_text, "stacc_fn_add:") != null);
     try std.testing.expect(std.mem.indexOf(u8, asm_text, "call stacc_fn_add") != null);
     try std.testing.expect(std.mem.indexOf(u8, asm_text, "call stacc_rt_print_i64") != null);
+}
+
+fn expectPeephole(input: []const u8, expected: []const u8) !void {
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    try peephole(input, &aw.writer);
+    try std.testing.expectEqualStrings(expected, aw.writer.buffered());
+}
+
+test "peephole collapses copy chains through transient registers" {
+    try expectPeephole(
+        \\    movq %rax, %r11
+        \\    movq %r11, %rsi
+        \\    movq %rsi, %rdi
+        \\    call stacc_rt_print_i64
+        \\
+    ,
+        \\    movq %rax, %rdi
+        \\    call stacc_rt_print_i64
+        \\
+    );
+}
+
+test "peephole never collapses through variable registers" {
+    // %rbx carries a variable across iterations; the store must stay
+    try expectPeephole(
+        \\    movq %rsi, %rbx    # store x
+        \\    movq %rbx, %rsi    # load x
+        \\
+    ,
+        \\    movq %rsi, %rbx    # store x
+        \\    movq %rbx, %rsi    # load x
+        \\
+    );
+}
+
+test "peephole shrinks immediates and keeps comments" {
+    try expectPeephole(
+        \\    movabsq $1, %rsi    # 1:i64
+        \\    movq %rsi, %r12    # store a
+        \\
+    ,
+        \\    movq $1, %r12    # store a
+        \\
+    );
+    try expectPeephole(
+        \\    movabsq $8589934592, %rsi
+        \\    movq %rsi, %r12
+        \\
+    ,
+        \\    movabsq $8589934592, %r12
+        \\
+    );
+}
+
+test "peephole guards impossible x86 forms" {
+    // mem-to-mem must not appear
+    try expectPeephole(
+        \\    movq -8(%rbp), %rsi
+        \\    movq %rsi, -16(%rbp)
+        \\    movq %rsi, %xmm0
+        \\
+    ,
+        \\    movq -8(%rbp), %rsi
+        \\    movq %rsi, -16(%rbp)
+        \\    movq %rsi, %xmm0
+        \\
+    );
+    // immediates cannot move into xmm
+    try expectPeephole(
+        \\    movabsq $4611686018427387904, %rsi
+        \\    movq %rsi, %xmm0
+        \\
+    ,
+        \\    movabsq $4611686018427387904, %rsi
+        \\    movq %rsi, %xmm0
+        \\
+    );
+}
+
+test "peephole does not collapse across labels or other instructions" {
+    try expectPeephole(
+        \\    movq %rax, %r11
+        \\.L5:
+        \\    movq %r11, %rsi
+        \\
+    ,
+        \\    movq %rax, %r11
+        \\.L5:
+        \\    movq %r11, %rsi
+        \\
+    );
+    try expectPeephole(
+        \\    movq %rax, %r11
+        \\    popq %rsi
+        \\    movq %r11, %rdi
+        \\
+    ,
+        \\    movq %rax, %r11
+        \\    popq %rsi
+        \\    movq %r11, %rdi
+        \\
+    );
+}
+
+test "peephole in the full pipeline: call result flows straight to print" {
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    const asm_text = try emitToText(allocator, "fn five():i64 { return 5; } print(five());", &aw);
+
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, "movq %rax, %rdi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, "%r11") == null);
 }
 
 test "more live variables than registers spill by furthest end" {

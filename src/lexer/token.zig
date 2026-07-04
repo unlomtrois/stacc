@@ -60,6 +60,7 @@ pub const Token = struct {
 
         // Scope resolution operators
         dot, // .
+        dot_dot, // .. (slice ranges)
         colon, // : (type annotations)
 
         semicolon,

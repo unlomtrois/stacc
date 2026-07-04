@@ -190,15 +190,22 @@ fn analyze(allocator: std.mem.Allocator, program: []const Instruction) !Plan {
         switch (inst) {
             .load => |l| {
                 builder.access(l.slot, index);
-                depth += 1;
+                if (l.type == .str) builder.access(l.slot + 1, index);
+                depth += value_mod.width(l.type);
             },
             .store => |s| {
                 builder.access(s.slot, index);
-                depth -= 1;
+                if (s.type == .str) builder.access(s.slot + 1, index);
+                depth -= value_mod.width(s.type);
             },
             .push_const => depth += 1,
+            .push_str => depth += 2,
+            .str_len => depth -= 1,
+            .str_index, .str_slice => depth -= 2,
+            .str_eq, .str_ne => depth -= 3,
             .add, .sub, .mul, .div, .pow, .eq, .ne, .lt, .gt, .le, .ge => depth -= 1,
-            .pop, .print, .jump_if_false => depth -= 1,
+            .pop, .jump_if_false => depth -= 1,
+            .print => |t| depth -= value_mod.width(t),
             .call => |c| {
                 depth -= c.num_params;
                 if (c.returns_value) depth += 1;
@@ -334,11 +341,13 @@ pub fn emitRaw(allocator: std.mem.Allocator, program: []const Instruction, write
     defer plan.deinit(allocator);
 
     var emitter = Emitter{
+        .allocator = allocator,
         .writer = writer,
         .program = program,
         .plan = &plan,
         .region = plan.regions.getPtr(0).?,
     };
+    defer emitter.strings.deinit(allocator);
     try emitter.run();
 }
 
@@ -464,12 +473,15 @@ pub fn peephole(text: []const u8, out: *std.Io.Writer) !void {
 }
 
 const Emitter = struct {
+    allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     program: []const Instruction,
     plan: *Plan,
     region: *const RegionPlan,
     depth: usize = 0,
     fn_end: ?usize = null,
+    /// string literal bytes, in .Lstr<index> label order
+    strings: std.ArrayList([]const u8) = .empty,
 
     fn run(self: *Emitter) !void {
         try self.writer.writeAll(
@@ -517,8 +529,29 @@ const Emitter = struct {
             \\.Lstacc_missing_return:
             \\    andq $-16, %rsp
             \\    call stacc_rt_missing_return
+            \\.Lstacc_bounds:
+            \\    andq $-16, %rsp
+            \\    call stacc_rt_bounds
             \\
         );
+
+        // string literal data
+        if (self.strings.items.len > 0) {
+            try self.writer.writeAll(".section .rodata\n");
+            for (self.strings.items, 0..) |bytes, id| {
+                try self.writer.print(".Lstr{d}:", .{id});
+                if (bytes.len == 0) {
+                    try self.writer.writeAll("\n");
+                    continue;
+                }
+                try self.writer.writeAll("\n    .byte ");
+                for (bytes, 0..) |b, i| {
+                    if (i > 0) try self.writer.writeAll(", ");
+                    try self.writer.print("{d}", .{b});
+                }
+                try self.writer.writeAll("\n");
+            }
+        }
     }
 
     /// Returns true when the next instruction was fused into this one.
@@ -547,6 +580,7 @@ const Emitter = struct {
                     .i32 => |x| x,
                     .i64 => |x| x,
                     .f64 => |x| @bitCast(x),
+                    .ptr => unreachable, // str constants use push_str
                 };
                 if (reg_mode) {
                     try w.print("    movabsq ${d}, {s}    # {f}\n", .{ bits, self.push(), v });
@@ -562,16 +596,155 @@ const Emitter = struct {
                 const home = self.region.slotLocation(&buf, l.slot);
                 if (reg_mode) {
                     try w.print("    movq {s}, {s}    # load {s}\n", .{ home, self.push(), l.name });
+                    if (l.type == .str) {
+                        const len_home = self.region.slotLocation(&buf2, l.slot + 1);
+                        try w.print("    movq {s}, {s}\n", .{ len_home, self.push() });
+                    }
                 } else {
                     try w.print("    pushq {s}    # load {s}\n", .{ home, l.name });
+                    if (l.type == .str) {
+                        const len_home = self.region.slotLocation(&buf2, l.slot + 1);
+                        try w.print("    pushq {s}\n", .{len_home});
+                    }
                 }
             },
             .store => |s| {
-                const home = self.region.slotLocation(&buf, s.slot);
-                if (reg_mode) {
-                    try w.print("    movq {s}, {s}    # store {s}\n", .{ self.popTop(), home, s.name });
+                if (s.type == .str) {
+                    // two slots: [ptr][len], len on top
+                    const len_home = self.region.slotLocation(&buf2, s.slot + 1);
+                    const ptr_home = self.region.slotLocation(&buf, s.slot);
+                    if (reg_mode) {
+                        try w.print("    movq {s}, {s}    # store {s}.len\n", .{ self.popTop(), len_home, s.name });
+                        try w.print("    movq {s}, {s}    # store {s}\n", .{ self.popTop(), ptr_home, s.name });
+                    } else {
+                        try w.print("    popq {s}    # store {s}.len\n", .{ len_home, s.name });
+                        try w.print("    popq {s}    # store {s}\n", .{ ptr_home, s.name });
+                    }
                 } else {
-                    try w.print("    popq {s}    # store {s}\n", .{ home, s.name });
+                    const home = self.region.slotLocation(&buf, s.slot);
+                    if (reg_mode) {
+                        try w.print("    movq {s}, {s}    # store {s}\n", .{ self.popTop(), home, s.name });
+                    } else {
+                        try w.print("    popq {s}    # store {s}\n", .{ home, s.name });
+                    }
+                }
+            },
+            .push_str => |bytes| {
+                const id = self.strings.items.len;
+                try self.strings.append(self.allocator, bytes);
+                if (reg_mode) {
+                    try w.print("    leaq .Lstr{d}(%rip), {s}\n", .{ id, self.push() });
+                    try w.print("    movq ${d}, {s}\n", .{ bytes.len, self.push() });
+                } else {
+                    try w.print(
+                        \\    leaq .Lstr{d}(%rip), %rax
+                        \\    pushq %rax
+                        \\    pushq ${d}
+                        \\
+                    , .{ id, bytes.len });
+                }
+            },
+            .str_len => {
+                if (reg_mode) {
+                    const len_loc = self.popTop();
+                    const ptr_loc = self.popTop();
+                    try w.print("    movq {s}, {s}\n", .{ len_loc, ptr_loc });
+                    _ = self.push(); // result sits where the ptr was
+                } else {
+                    try w.writeAll(
+                        \\    popq %rax
+                        \\    addq $8, %rsp
+                        \\    pushq %rax
+                        \\
+                    );
+                }
+            },
+            .str_index => {
+                if (reg_mode) {
+                    const idx = self.popTop();
+                    const len = self.popTop();
+                    const ptr = self.popTop();
+                    // unsigned compare catches negative indexes too
+                    try w.print(
+                        \\    cmpq {s}, {s}
+                        \\    jae .Lstacc_bounds
+                        \\
+                    , .{ len, idx });
+                    try w.print("    movzbq ({s},{s}), {s}\n", .{ ptr, idx, self.push() });
+                } else {
+                    try w.writeAll(
+                        \\    popq %rcx
+                        \\    popq %rax
+                        \\    popq %rdx
+                        \\    cmpq %rax, %rcx
+                        \\    jae .Lstacc_bounds
+                        \\    movzbq (%rdx,%rcx), %rax
+                        \\    pushq %rax
+                        \\
+                    );
+                }
+            },
+            .str_slice => {
+                if (reg_mode) {
+                    const high = self.popTop();
+                    const low = self.popTop();
+                    const len = self.popTop();
+                    const ptr = self.popTop();
+                    try w.print(
+                        \\    testq {s}, {s}
+                        \\    js .Lstacc_bounds
+                        \\    cmpq {s}, {s}
+                        \\    jg .Lstacc_bounds
+                        \\    cmpq {s}, {s}
+                        \\    jg .Lstacc_bounds
+                        \\    addq {s}, {s}
+                        \\    subq {s}, {s}
+                        \\
+                    , .{ low, low, high, low, len, high, low, ptr, low, high });
+                    _ = self.push(); // ptr+low, already in place
+                    const len_dst = self.push();
+                    try w.print("    movq {s}, {s}\n", .{ high, len_dst });
+                } else {
+                    try w.writeAll(
+                        \\    popq %rcx
+                        \\    popq %rax
+                        \\    popq %rdx
+                        \\    popq %r11
+                        \\    testq %rax, %rax
+                        \\    js .Lstacc_bounds
+                        \\    cmpq %rcx, %rax
+                        \\    jg .Lstacc_bounds
+                        \\    cmpq %rdx, %rcx
+                        \\    jg .Lstacc_bounds
+                        \\    addq %rax, %r11
+                        \\    subq %rax, %rcx
+                        \\    pushq %r11
+                        \\    pushq %rcx
+                        \\
+                    );
+                }
+            },
+            .str_eq, .str_ne => {
+                // C helper: flush the pool (caller-saved), pop the four
+                // slots into the SysV argument registers
+                if (reg_mode) try self.flush();
+                try w.writeAll(
+                    \\    popq %rcx
+                    \\    popq %rdx
+                    \\    popq %rsi
+                    \\    popq %rdi
+                    \\
+                );
+                try self.emitHelperCall("stacc_rt_str_eq");
+                if (inst == .str_ne) {
+                    try w.writeAll("    xorq $1, %rax\n");
+                }
+                if (reg_mode) {
+                    self.depth -= 4;
+                    try self.unflush(self.depth);
+                    try w.print("    movq %rax, {s}\n", .{self.push()});
+                } else {
+                    try w.writeAll("    pushq %rax\n");
                 }
             },
             .add, .sub, .mul => |t| {
@@ -913,7 +1086,7 @@ const Emitter = struct {
                     }
                 },
                 .i64 => {}, // integers are kept sign-extended; widening is free
-                .bool => unreachable, // nothing coerces to bool
+                .bool, .str => unreachable, // nothing coerces to these
             },
             .convert_under => |t| {
                 std.debug.assert(t == .f64); // only int -> f64 changes representation
@@ -935,14 +1108,27 @@ const Emitter = struct {
             },
             .print => |t| {
                 if (reg_mode) {
-                    std.debug.assert(self.depth == 1);
-                    const operand = self.popTop();
-                    switch (t) {
-                        .f64 => try w.print("    movq {s}, %xmm0\n", .{operand}),
-                        else => try w.print("    movq {s}, %rdi\n", .{operand}),
+                    std.debug.assert(self.depth == value_mod.width(t));
+                    if (t == .str) {
+                        // [ptr][len] sit in %rsi/%rdi; the helper wants
+                        // (ptr, len) = (%rdi, %rsi)
+                        _ = self.popTop();
+                        _ = self.popTop();
+                        try w.writeAll("    xchgq %rsi, %rdi\n");
+                    } else {
+                        const operand = self.popTop();
+                        switch (t) {
+                            .f64 => try w.print("    movq {s}, %xmm0\n", .{operand}),
+                            else => try w.print("    movq {s}, %rdi\n", .{operand}),
+                        }
                     }
                 } else {
                     switch (t) {
+                        .str => try w.writeAll(
+                            \\    popq %rsi
+                            \\    popq %rdi
+                            \\
+                        ),
                         .f64 => try w.writeAll(
                             \\    popq %rax
                             \\    movq %rax, %xmm0
@@ -952,6 +1138,7 @@ const Emitter = struct {
                     }
                 }
                 try self.emitHelperCall(switch (t) {
+                    .str => "stacc_rt_print_str",
                     .f64 => "stacc_rt_print_f64",
                     .bool => "stacc_rt_print_bool",
                     else => "stacc_rt_print_i64",
@@ -1084,7 +1271,7 @@ fn emitNarrowCheck(writer: *std.Io.Writer, t: Type) !void {
             \\
         ),
         .i64 => {},
-        .bool, .f64 => unreachable,
+        .bool, .f64, .str => unreachable,
     }
 }
 
@@ -1266,6 +1453,25 @@ test "peephole in the full pipeline: call result flows straight to print" {
 
     try std.testing.expect(std.mem.indexOf(u8, asm_text, "movq %rax, %rdi") != null);
     try std.testing.expect(std.mem.indexOf(u8, asm_text, "%r11") == null);
+}
+
+test "strings lower to rodata labels, bounds checks and helpers" {
+    const allocator = std.testing.allocator;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    const asm_text = try emitToText(allocator,
+        \\let s = "hi";
+        \\print(s[0..1]);
+        \\print(s == "hi");
+    , &aw);
+
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, ".section .rodata") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, ".Lstr0:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, "leaq .Lstr0(%rip)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, ".byte 104, 105") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, "js .Lstacc_bounds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, "call stacc_rt_str_eq") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, "call stacc_rt_print_str") != null);
 }
 
 test "more live variables than registers spill by furthest end" {

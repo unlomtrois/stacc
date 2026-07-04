@@ -25,7 +25,7 @@ Compilation is a single forward pass: O(n) time, O(nesting depth) auxiliary memo
 ## The language
 
 ```
-# types: bool, i8, i32, i64, f64. Literals default to i64 (f64 with a dot)
+# types: bool, i8, i32, i64, f64, str. Literals default to i64 (f64 with a dot)
 let x:i8 = 5 + 2;          # annotations coerce (range-checked)
 let y = x + 3;             # inference: i8 + i64 unifies to i64
 let z = 2:f64 / 8;         # typed literals promote the expression
@@ -43,7 +43,14 @@ fn add(a:i64, b:i64):i64 { # declare before use; recursion works
     return a + b;
 }
 print(add(y, add(1, 2)));  # calls nest in expressions
+
+let s = "hello, stacy";    # str: a two-slot fat value (ptr, len), no allocation
+print(s[7..12]);           # bounds-checked view, no copy
+print(s.len);
+print(s[7..12] == "stacy");
 ```
+
+Compound values follow the same principle as everything else: the type stack holds one entry (`str`), the value stack holds its two slots. Construction, `.len` and slicing are type-stack events plus a few register ops; a str variable's pointer and length get register-allocated independently.
 
 Checked at compile time: undefined variables and functions, float-into-int annotations, non-bool conditions, arity mismatches, arithmetic on bool, chained comparisons, malformed expressions (`1 2`, `1 +`). Integer narrowing stays a runtime range check on the actual value.
 

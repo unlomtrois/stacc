@@ -1,8 +1,8 @@
 const std = @import("std");
 
 /// Integer types are declared in widening order; `unify` relies on it.
-/// `bool` never participates in unification or arithmetic.
-pub const Type = enum { bool, i8, i32, i64, f64 };
+/// `bool` and `str` never participate in unification or arithmetic.
+pub const Type = enum { bool, i8, i32, i64, f64, str };
 
 pub const type_names = std.StaticStringMap(Type).initComptime(.{
     .{ "bool", .bool },
@@ -10,17 +10,40 @@ pub const type_names = std.StaticStringMap(Type).initComptime(.{
     .{ "i32", .i32 },
     .{ "i64", .i64 },
     .{ "f64", .f64 },
+    .{ "str", .str },
 });
 
-pub const Value = union(Type) {
+/// How many stack slots a value of this type occupies. The type stack
+/// keeps one entry per value; the value stack holds `width` slots.
+/// str is a fat value: (pointer, length).
+pub fn width(t: Type) u32 {
+    return switch (t) {
+        .str => 2,
+        else => 1,
+    };
+}
+
+/// A single runtime stack slot. Compound values (str) span several
+/// slots, so this is deliberately NOT union(Type): `.ptr` is one half
+/// of a str, never a complete value.
+pub const Value = union(enum) {
     bool: bool,
     i8: i8,
     i32: i32,
     i64: i64,
     f64: f64,
+    ptr: [*]const u8,
 
+    /// Only meaningful for scalar values (constants, arithmetic).
     pub fn getType(self: Value) Type {
-        return std.meta.activeTag(self);
+        return switch (self) {
+            .bool => .bool,
+            .i8 => .i8,
+            .i32 => .i32,
+            .i64 => .i64,
+            .f64 => .f64,
+            .ptr => unreachable, // never a standalone typed value
+        };
     }
 
     pub fn isFloat(self: Value) bool {
@@ -33,7 +56,7 @@ pub const Value = union(Type) {
             .i8 => |v| v,
             .i32 => |v| v,
             .i64 => |v| v,
-            .bool, .f64 => unreachable,
+            .bool, .f64, .ptr => unreachable,
         };
     }
 
@@ -43,20 +66,21 @@ pub const Value = union(Type) {
             .i32 => |v| @floatFromInt(v),
             .i64 => |v| @floatFromInt(v),
             .f64 => |v| v,
-            .bool => unreachable,
+            .bool, .ptr => unreachable,
         };
     }
 
     /// Convert to `target`. Int widening/narrowing is range-checked,
-    /// int -> f64 is allowed, f64 -> int is a type mismatch, and bool
-    /// converts to and from nothing.
+    /// int -> f64 is allowed, f64 -> int is a type mismatch, and bool,
+    /// str and pointers convert to and from nothing.
     pub fn coerce(self: Value, target: Type) !Value {
+        if (self == .ptr or target == .str) return error.TypeMismatch;
         if (self.getType() == target) return self;
         if (self == .bool or target == .bool) return error.TypeMismatch;
         if (self == .f64) return error.TypeMismatch; // no implicit float -> int
         const int = self.asI64();
         return switch (target) {
-            .bool => unreachable,
+            .bool, .str => unreachable,
             .i8 => .{ .i8 = std.math.cast(i8, int) orelse return error.Overflow },
             .i32 => .{ .i32 = std.math.cast(i32, int) orelse return error.Overflow },
             .i64 => .{ .i64 = int },
@@ -68,6 +92,7 @@ pub const Value = union(Type) {
         switch (self) {
             .bool => |v| try writer.writeAll(if (v) "true" else "false"),
             .f64 => |v| try writer.print("{d}", .{v}),
+            .ptr => unreachable, // str printing is handled by the VM
             inline else => |v| try writer.print("{d}", .{v}),
         }
     }
@@ -83,17 +108,18 @@ pub const Value = union(Type) {
 /// otherwise the wider of the two integer types. Callers must reject
 /// bool operands before unifying.
 pub fn unify(a: Type, b: Type) Type {
-    std.debug.assert(a != .bool and b != .bool);
+    std.debug.assert(a != .bool and b != .bool and a != .str and b != .str);
     if (a == .f64 or b == .f64) return .f64;
     return if (@intFromEnum(a) > @intFromEnum(b)) a else b;
 }
 
 /// Static coercibility check: mirrors `Value.coerce` at the type level.
 /// Narrowing int conversions are allowed here (the VM range-checks the
-/// actual value); float -> int and anything involving bool are not.
+/// actual value); float -> int and anything involving bool or str is not.
 pub fn canCoerce(from: Type, to: Type) bool {
     if (from == to) return true;
     if (from == .bool or to == .bool) return false;
+    if (from == .str or to == .str) return false;
     if (from == .f64) return false;
     return true;
 }
@@ -137,6 +163,18 @@ test "bool converts to and from nothing" {
     try std.testing.expectError(error.TypeMismatch, b.coerce(.i64));
     try std.testing.expectError(error.TypeMismatch, (Value{ .i64 = 1 }).coerce(.bool));
     try std.testing.expectError(error.TypeMismatch, (Value{ .f64 = 1 }).coerce(.bool));
+}
+
+test "str is a two-slot fat value that coerces to nothing" {
+    try std.testing.expectEqual(@as(u32, 2), width(.str));
+    try std.testing.expectEqual(@as(u32, 1), width(.i64));
+    try std.testing.expect(canCoerce(.str, .str));
+    try std.testing.expect(!canCoerce(.str, .i64));
+    try std.testing.expect(!canCoerce(.i64, .str));
+    try std.testing.expectEqual(Type.str, type_names.get("str").?);
+
+    const p = Value{ .ptr = "x" };
+    try std.testing.expectError(error.TypeMismatch, p.coerce(.i64));
 }
 
 test "canCoerce mirrors coerce statically" {

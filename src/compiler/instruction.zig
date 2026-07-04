@@ -53,6 +53,19 @@ pub const Instruction = union(enum) {
     convert_under: Type,
     /// pop and print a value of the statically known type
     print: Type,
+    /// push a str: pointer to the bytes, then the length (2 slots).
+    /// The slice points into the source buffer; native codegen copies
+    /// the bytes into .rodata.
+    push_str: []const u8,
+    /// [ptr][len] -> [len]
+    str_len,
+    /// [ptr][len][idx] -> [byte as i64], bounds-checked
+    str_index,
+    /// [ptr][len][a][b] -> [ptr+a][b-a], checked 0 <= a <= b <= len
+    str_slice,
+    /// [ptr][len][ptr][len] -> [bool], content comparison
+    str_eq,
+    str_ne,
 
     pub const FnPrologue = struct {
         name: []const u8,
@@ -111,6 +124,12 @@ pub const Instruction = union(enum) {
             .pop => try writer.writeAll("pop"),
             .convert => |t| try writer.print("{s}.convert", .{@tagName(t)}),
             .convert_under => |t| try writer.print("{s}.convert_under", .{@tagName(t)}),
+            .push_str => |bytes| try writer.print("str.const \"{s}\"", .{bytes}),
+            .str_len => try writer.writeAll("str.len"),
+            .str_index => try writer.writeAll("str.index"),
+            .str_slice => try writer.writeAll("str.slice"),
+            .str_eq => try writer.writeAll("str.eq"),
+            .str_ne => try writer.writeAll("str.ne"),
             inline .jump, .jump_if_false => |target, op| {
                 if (target == unresolved) {
                     try writer.print("{s} -> ?", .{@tagName(op)});

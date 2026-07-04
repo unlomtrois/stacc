@@ -62,7 +62,7 @@ pub const Lexer = struct {
             '"' => self.lexString(),
 
             // scope operators
-            '.' => .dot,
+            '.' => if (self.match('.')) .dot_dot else .dot,
             ':' => .colon,
             ';' => .semicolon,
             ',' => .comma,
@@ -426,6 +426,11 @@ test "float literals" {
 test "dot after number without digit is not a float" {
     const src = "5.foo";
     try helper(src, &[_]Token.Tag{ .literal_number, .dot, .identifier });
+}
+
+test "dot dot for slice ranges" {
+    try helper("s[1..3]", &[_]Token.Tag{ .identifier, .l_bracket, .literal_number, .dot_dot, .literal_number, .r_bracket });
+    try helper("s.len", &[_]Token.Tag{ .identifier, .dot, .identifier });
 }
 
 test "skip comments" {

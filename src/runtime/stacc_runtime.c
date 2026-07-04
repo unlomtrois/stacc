@@ -2,6 +2,7 @@
  * Compiled and linked together with the generated .s by `zig cc`. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 void stacc_rt_print_i64(long long v) { printf("%lld\n", v); }
@@ -9,6 +10,21 @@ void stacc_rt_print_i64(long long v) { printf("%lld\n", v); }
 void stacc_rt_print_f64(double v) { printf("%.15g\n", v); }
 
 void stacc_rt_print_bool(long long v) { puts(v ? "true" : "false"); }
+
+void stacc_rt_print_str(const char *p, long long n) {
+    fwrite(p, 1, (size_t)n, stdout);
+    putchar('\n');
+}
+
+long long stacc_rt_str_eq(const char *a, long long alen, const char *b, long long blen) {
+    if (alen != blen) return 0;
+    return alen == 0 || memcmp(a, b, (size_t)alen) == 0;
+}
+
+_Noreturn void stacc_rt_bounds(void) {
+    fprintf(stderr, "error: OutOfBounds\n");
+    exit(1);
+}
 
 _Noreturn void stacc_rt_div0(void) {
     fprintf(stderr, "error: DivisionByZero\n");

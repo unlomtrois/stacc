@@ -48,10 +48,53 @@ pub const Vm = struct {
             pc += 1;
             switch (inst) {
                 .push_const => |v| try self.stack.append(self.allocator, v),
-                .load => |l| try self.stack.append(self.allocator, self.slots.items[self.slot_base + l.slot]),
+                .load => |l| {
+                    try self.stack.append(self.allocator, self.slots.items[self.slot_base + l.slot]);
+                    if (l.type == .str) {
+                        try self.stack.append(self.allocator, self.slots.items[self.slot_base + l.slot + 1]);
+                    }
+                },
                 .store => |s| {
-                    const v = try (try self.pop()).coerce(s.type);
-                    self.slots.items[self.slot_base + s.slot] = v;
+                    if (s.type == .str) {
+                        const len = try self.pop();
+                        const ptr = try self.pop();
+                        if (len != .i64 or ptr != .ptr) return error.TypeMismatch;
+                        self.slots.items[self.slot_base + s.slot] = ptr;
+                        self.slots.items[self.slot_base + s.slot + 1] = len;
+                    } else {
+                        const v = try (try self.pop()).coerce(s.type);
+                        self.slots.items[self.slot_base + s.slot] = v;
+                    }
+                },
+                .push_str => |bytes| {
+                    try self.stack.append(self.allocator, .{ .ptr = bytes.ptr });
+                    try self.stack.append(self.allocator, .{ .i64 = @intCast(bytes.len) });
+                },
+                .str_len => {
+                    const len = try self.pop();
+                    const ptr = try self.pop();
+                    if (len != .i64 or ptr != .ptr) return error.TypeMismatch;
+                    try self.stack.append(self.allocator, len);
+                },
+                .str_index => {
+                    const idx = try self.popInt();
+                    const s = try self.popStr();
+                    if (idx < 0 or idx >= s.len) return error.OutOfBounds;
+                    try self.stack.append(self.allocator, .{ .i64 = s[@intCast(idx)] });
+                },
+                .str_slice => {
+                    const high = try self.popInt();
+                    const low = try self.popInt();
+                    const s = try self.popStr();
+                    if (low < 0 or low > high or high > s.len) return error.OutOfBounds;
+                    try self.stack.append(self.allocator, .{ .ptr = s.ptr + @as(usize, @intCast(low)) });
+                    try self.stack.append(self.allocator, .{ .i64 = high - low });
+                },
+                .str_eq, .str_ne => {
+                    const rhs = try self.popStr();
+                    const lhs = try self.popStr();
+                    const equal = std.mem.eql(u8, lhs, rhs);
+                    try self.stack.append(self.allocator, .{ .bool = if (inst == .str_eq) equal else !equal });
                 },
                 .enter => |n| try self.slots.appendNTimes(self.allocator, .{ .i64 = 0 }, n),
                 .fn_prologue => {}, // frame setup is done by .call; native codegen uses this
@@ -95,12 +138,16 @@ pub const Vm = struct {
                     if (v != .bool) return error.TypeMismatch;
                     if (!v.bool) pc = target;
                 },
-                .print => {
-                    // the static type is for native codegen; the VM's
-                    // values carry their own tags
-                    const v = try self.pop();
-                    try v.write(self.writer);
-                    try self.writer.writeByte('\n');
+                .print => |t| {
+                    if (t == .str) {
+                        const s = try self.popStr();
+                        try self.writer.writeAll(s);
+                        try self.writer.writeByte('\n');
+                    } else {
+                        const v = try self.pop();
+                        try v.write(self.writer);
+                        try self.writer.writeByte('\n');
+                    }
                 },
             }
         }
@@ -108,6 +155,20 @@ pub const Vm = struct {
 
     fn pop(self: *Vm) !Value {
         return self.stack.pop() orelse error.StackUnderflow;
+    }
+
+    fn popInt(self: *Vm) !i64 {
+        const v = try self.pop();
+        if (v == .ptr or v == .bool or v == .f64) return error.TypeMismatch;
+        return v.asI64();
+    }
+
+    /// Pop a str's two slots ([ptr][len], len on top).
+    fn popStr(self: *Vm) ![]const u8 {
+        const len = try self.pop();
+        const ptr = try self.pop();
+        if (len != .i64 or ptr != .ptr) return error.TypeMismatch;
+        return ptr.ptr[0..@intCast(len.i64)];
     }
 
     const BinOp = enum { add, sub, mul, div, pow };
@@ -122,7 +183,7 @@ pub const Vm = struct {
         // safety net: the static type of a slot can diverge from its
         // runtime value after a conditional redeclaration, so mismatched
         // operands are a runtime error rather than undefined behavior
-        if (lhs == .bool or rhs == .bool) return error.TypeMismatch;
+        if (lhs == .bool or rhs == .bool or lhs == .ptr or rhs == .ptr) return error.TypeMismatch;
         if (t != .f64 and (lhs == .f64 or rhs == .f64)) return error.TypeMismatch;
 
         const result: Value = if (t == .f64) blk: {
@@ -157,7 +218,7 @@ pub const Vm = struct {
         const rhs = try self.pop();
         const lhs = try self.pop();
 
-        if (lhs == .bool or rhs == .bool) return error.TypeMismatch;
+        if (lhs == .bool or rhs == .bool or lhs == .ptr or rhs == .ptr) return error.TypeMismatch;
         if (t != .f64 and (lhs == .f64 or rhs == .f64)) return error.TypeMismatch;
 
         const result = if (t == .f64) blk: {

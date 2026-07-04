@@ -1,0 +1,26 @@
+# str: a two-slot fat value (pointer, length) into static data.
+# construction, len, indexing, slicing and equality are all
+# bounds-checked; none of it allocates.
+
+let greeting = "hello, stacy";
+print(greeting);
+print(greeting.len);          # 12
+
+let word = greeting[7..12];   # a view, no copy
+print(word);                  # stacy
+print(word == "stacy");       # true
+print(greeting[0]);           # 104, the byte 'h'
+
+fn shout(s:str) {             # str parameters take two slots
+    print(s);
+    print(s.len);
+}
+shout(word);
+shout("postfix"[0..4]);       # chains work on literals too
+
+# slices with dynamic bounds
+let i = 0;
+while (i < 3) {
+    print(greeting[0..i + 2]);
+    i = i + 1;
+}

@@ -100,6 +100,8 @@ const Compiler = struct {
         entry: usize,
         /// parameter types in order; owned by the compiler
         params: []value_mod.Type,
+        /// total slots the parameters occupy (str params take 2)
+        param_slots: u32,
         /// null = void function
         return_type: ?value_mod.Type,
         /// full frame size (params + locals); valid once finalized
@@ -128,6 +130,8 @@ const Compiler = struct {
         ArgumentCountMismatch,
         DuplicateDefinition,
         ReturnOutsideFunction,
+        UnknownField,
+        UnsupportedType,
     };
 
     fn compileProgram(self: *Compiler) Error!void {
@@ -226,7 +230,7 @@ const Compiler = struct {
                 const gop = try self.var_types.getOrPut(self.allocator, param_name);
                 if (gop.found_existing) return error.DuplicateDefinition;
                 gop.value_ptr.* = .{ .slot = self.next_slot, .type = param_type };
-                self.next_slot += 1;
+                self.next_slot += value_mod.width(param_type);
                 try params.append(self.allocator, param_type);
 
                 const sep = self.next();
@@ -241,6 +245,8 @@ const Compiler = struct {
             const type_token = try self.expect(.identifier);
             return_type = value_mod.type_names.get(type_token.getValue(self.src)) orelse
                 return error.UnknownType;
+            // v1: native returns pass through a single register
+            if (return_type == .str) return error.UnsupportedType;
             token = self.next();
         }
         if (token.tag != .l_brace) return error.UnexpectedToken;
@@ -250,10 +256,11 @@ const Compiler = struct {
         try self.emit(.{ .jump = instruction_mod.unresolved });
 
         const entry = self.instructions.items.len;
-        const num_params: u32 = @intCast(params.items.len);
+        const param_slots = self.next_slot; // params were registered first
         try self.fn_table.put(self.allocator, name, .{
             .entry = entry,
             .params = try params.toOwnedSlice(self.allocator),
+            .param_slots = param_slots,
             .return_type = return_type,
             .num_slots = 0,
             .finalized = false,
@@ -262,10 +269,11 @@ const Compiler = struct {
             std.debug.print("── fn {s} @{d} ──\n", .{ name, entry });
         }
         // frame-shape marker for native codegen (a VM no-op); its
-        // num_slots is patched below, together with the recursive calls
+        // num_slots is patched below, together with the recursive calls.
+        // num_params counts SLOTS (a str parameter is two).
         try self.emit(.{ .fn_prologue = .{
             .name = name,
-            .num_params = num_params,
+            .num_params = param_slots,
             .num_slots = 0,
             .returns_value = return_type != null,
         } });
@@ -368,7 +376,7 @@ const Compiler = struct {
         try self.emit(.{ .call = .{
             .name = name,
             .target = info.entry,
-            .num_params = @intCast(info.params.len),
+            .num_params = info.param_slots,
             .num_slots = info.num_slots,
             .returns_value = info.return_type != null,
         } });
@@ -478,11 +486,13 @@ const Compiler = struct {
             if (!value_mod.canCoerce(expr_type, t)) return error.TypeMismatch;
         }
         const var_type = declared_type orelse expr_type;
-        // redeclaration reuses the slot and just updates the static type
+        // redeclaration reuses the slot and just updates the static
+        // type, unless the width changed (then the old slots are
+        // abandoned and fresh ones allocated)
         const gop = try self.var_types.getOrPut(self.allocator, name);
-        if (!gop.found_existing) {
+        if (!gop.found_existing or value_mod.width(gop.value_ptr.type) != value_mod.width(var_type)) {
             gop.value_ptr.slot = self.next_slot;
-            self.next_slot += 1;
+            self.next_slot += value_mod.width(var_type);
         }
         gop.value_ptr.type = var_type;
         try self.emitConvertTo(expr_type, var_type);
@@ -579,7 +589,16 @@ const Compiler = struct {
                         const info = self.var_types.get(name) orelse return error.UndefinedVariable;
                         try self.type_stack.append(self.allocator, info.type);
                         try self.emit(.{ .load = .{ .name = name, .slot = info.slot, .type = info.type } });
+                        try self.compilePostfix();
                     }
+                    emitted_anything = true;
+                },
+                .literal_string => {
+                    const quoted = token.getValue(self.src);
+                    const bytes = quoted[1 .. quoted.len - 1]; // strip the quotes
+                    try self.type_stack.append(self.allocator, .str);
+                    try self.emit(.{ .push_str = bytes });
+                    try self.compilePostfix();
                     emitted_anything = true;
                 },
                 .plus,
@@ -643,10 +662,78 @@ const Compiler = struct {
                     self.last_terminator = .semicolon;
                     return self.finishExpression(base);
                 },
+                // `]` closes an index or slice expression; `..` separates
+                // slice bounds (terminator == .dot_dot accepts either,
+                // with last_terminator recording which)
+                .r_bracket, .dot_dot => {
+                    const accepted = switch (token.tag) {
+                        .r_bracket => terminator == .r_bracket or terminator == .dot_dot,
+                        .dot_dot => terminator == .dot_dot,
+                        else => unreachable,
+                    };
+                    if (!accepted) return error.UnexpectedToken;
+                    while (op_stack.pop()) |top| {
+                        if (top == .l_paren) return error.UnmatchedParenthesis;
+                        try self.emitOperator(top);
+                    }
+                    if (!emitted_anything) return error.ExpectedExpression;
+                    self.last_terminator = token.tag;
+                    return self.finishExpression(base);
+                },
                 .eof => return error.UnexpectedEof,
                 else => return error.UnsupportedOperator,
             }
         }
+    }
+
+    /// Postfix operations on the operand just pushed: `.len`, `[index]`
+    /// and `[low..high]`. They chain (`s[1..4].len`), and each is a
+    /// pure type-stack event plus one typed instruction.
+    fn compilePostfix(self: *Compiler) Error!void {
+        while (true) {
+            const token = self.next();
+            switch (token.tag) {
+                .dot => {
+                    const field = try self.expect(.identifier);
+                    if (!std.mem.eql(u8, field.getValue(self.src), "len")) return error.UnknownField;
+                    if (self.typeStackTop() != .str) return error.TypeMismatch;
+                    _ = self.type_stack.pop();
+                    try self.type_stack.append(self.allocator, .i64);
+                    try self.emit(.str_len);
+                },
+                .l_bracket => {
+                    if (self.typeStackTop() != .str) return error.TypeMismatch;
+                    // first bound: ends at `..` (slice) or `]` (index)
+                    const low_type = try self.compileExpression(.dot_dot);
+                    if (!value_mod.canCoerce(low_type, .i64)) return error.TypeMismatch;
+                    try self.emitConvertTo(low_type, .i64);
+                    if (self.last_terminator == .dot_dot) {
+                        const high_type = try self.compileExpression(.r_bracket);
+                        if (!value_mod.canCoerce(high_type, .i64)) return error.TypeMismatch;
+                        try self.emitConvertTo(high_type, .i64);
+                        _ = self.type_stack.pop(); // high
+                        _ = self.type_stack.pop(); // low
+                        _ = self.type_stack.pop(); // the str
+                        try self.type_stack.append(self.allocator, .str);
+                        try self.emit(.str_slice);
+                    } else {
+                        _ = self.type_stack.pop(); // index
+                        _ = self.type_stack.pop(); // the str
+                        try self.type_stack.append(self.allocator, .i64);
+                        try self.emit(.str_index);
+                    }
+                },
+                else => {
+                    self.peeked = token;
+                    return;
+                },
+            }
+        }
+    }
+
+    fn typeStackTop(self: *Compiler) ?value_mod.Type {
+        if (self.type_stack.items.len == 0) return null;
+        return self.type_stack.items[self.type_stack.items.len - 1];
     }
 
     /// A well-formed expression leaves exactly one new value on the stack.
@@ -662,6 +749,20 @@ const Compiler = struct {
         const items = self.type_stack.items;
         var rhs = items[items.len - 1];
         var lhs = items[items.len - 2];
+        // strings support equality only
+        if (lhs == .str or rhs == .str) {
+            if (lhs != .str or rhs != .str) return error.TypeMismatch;
+            const inst: Instruction = switch (tag) {
+                .equal_equal => .str_eq,
+                .not_equal => .str_ne,
+                else => return error.TypeMismatch,
+            };
+            _ = self.type_stack.pop();
+            _ = self.type_stack.pop();
+            try self.type_stack.append(self.allocator, .bool);
+            try self.emit(inst);
+            return;
+        }
         // no arithmetic or ordering on bools (rules out chained comparisons
         // like `1 < 2 < 3` as well)
         if (lhs == .bool or rhs == .bool) return error.TypeMismatch;
@@ -1242,6 +1343,83 @@ test "runtime error: argument narrowing overflow" {
     defer aw.deinit();
     const src = "fn f(x:i8):i8 { return x; } print(f(300));";
     try std.testing.expectError(error.Overflow, interpret(allocator, src, &aw.writer));
+}
+
+// ── strings ────────────────────────────────────────────────────────
+
+test "string literals, print, len" {
+    try interpretCapture("print(\"hello\");", "hello\n");
+    try interpretCapture("let s = \"hello\"; print(s.len);", "5\n");
+    try interpretCapture("print(\"\".len);", "0\n");
+}
+
+test "string indexing and slicing" {
+    try interpretCapture("print(\"abc\"[1]);", "98\n");
+    try interpretCapture("let s = \"hello, stacy\"; print(s[7..12]);", "stacy\n");
+    try interpretCapture("print(\"chain\"[1..4].len);", "3\n"); // postfix chains
+    try interpretCapture("let s = \"abcdef\"; let i = 2; print(s[i..i + 3]);", "cde\n"); // dynamic bounds
+    try interpretCapture("print(\"abc\"[1:i8]);", "98\n"); // index coerces to i64
+}
+
+test "string equality is by content" {
+    try interpretCapture("print(\"abc\" == \"abc\");", "true\n");
+    try interpretCapture("print(\"abc\" == \"abd\");", "false\n");
+    try interpretCapture("print(\"abc\" != \"ab\");", "true\n");
+    try interpretCapture("let s = \"xy\"; let t = \"x\"; print(s[0..1] == t);", "true\n");
+    try interpretCapture("let s = \"go\"; if (s == \"go\") { print(1); }", "1\n");
+}
+
+test "str variables and parameters occupy two slots" {
+    const allocator = std.testing.allocator;
+    const program = try compile(allocator, "let s = \"hi\"; let x = 1; print(x);");
+    defer allocator.free(program);
+    // s takes slots 0..1 and x slot 2, so the frame is 3 slots
+    try std.testing.expectEqual(Instruction{ .enter = 3 }, program[0]);
+
+    try interpretCapture(
+        \\fn middle(s:str, fallback:i64):i64 {
+        \\    if (s.len > 2) { return s[1]; }
+        \\    return fallback;
+        \\}
+        \\print(middle("abc", 0));
+        \\print(middle("x", 42));
+    , "98\n42\n");
+}
+
+test "static error: strings do not mix with numbers" {
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = \"a\" + 1;"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = \"a\" + \"b\";"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = \"a\" < \"b\";"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = \"a\" == 1;"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x:i64 = \"a\";"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let s:str = 1;"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "if (\"a\") { }"));
+}
+
+test "static error: bad postfix" {
+    try std.testing.expectError(error.UnknownField, compile(std.testing.allocator, "print(\"a\".size);"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = 1; print(x[0]);"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "print(\"abc\"[1.5]);"));
+    try std.testing.expectError(error.UnexpectedToken, compile(std.testing.allocator, "print(\"abc\"[1..2..3]);"));
+}
+
+test "static error: str return type is not supported yet" {
+    try std.testing.expectError(error.UnsupportedType, compile(std.testing.allocator, "fn f():str { return \"a\"; }"));
+}
+
+test "runtime error: string bounds" {
+    const cases = [_][]const u8{
+        "print(\"abc\"[5]);",
+        "print(\"abc\"[0 - 1]);",
+        "let s = \"abc\"; print(s[2..1]);",
+        "print(\"abc\"[1..9]);",
+    };
+    for (cases) |src| {
+        const allocator = std.testing.allocator;
+        var aw = std.Io.Writer.Allocating.init(allocator);
+        defer aw.deinit();
+        try std.testing.expectError(error.OutOfBounds, interpret(allocator, src, &aw.writer));
+    }
 }
 
 test "runtime error: overflow on typed let" {

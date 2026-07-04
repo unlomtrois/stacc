@@ -21,6 +21,8 @@ pub fn compile(allocator: std.mem.Allocator, src: []const u8) ![]Instruction {
         .instructions = .empty,
     };
     errdefer compiler.instructions.deinit(allocator);
+    defer compiler.type_stack.deinit(allocator);
+    defer compiler.var_types.deinit(allocator);
 
     try compiler.compileProgram();
     return compiler.instructions.toOwnedSlice(allocator);
@@ -43,6 +45,11 @@ const Compiler = struct {
     instructions: std.ArrayList(Instruction),
     /// one-token pushback buffer, filled by peeking past a literal
     peeked: ?Token = null,
+    /// compile-time mirror of the runtime value stack: holds the static
+    /// type of every value the compiled code will have pushed so far
+    type_stack: std.ArrayList(value_mod.Type) = .empty,
+    /// static types of declared variables
+    var_types: std.StringHashMapUnmanaged(value_mod.Type) = .empty,
 
     fn compileProgram(self: *Compiler) !void {
         while (true) {
@@ -77,24 +84,35 @@ const Compiler = struct {
         }
         if (token.tag != .equal) return error.UnexpectedToken;
 
-        try self.compileExpression(.semicolon);
+        const expr_type = try self.compileExpression(.semicolon);
+        if (declared_type) |t| {
+            // static check: float never fits an int annotation; int narrowing
+            // stays a runtime range check on the actual value
+            if (expr_type == .f64 and t != .f64) return error.TypeMismatch;
+        }
+        try self.var_types.put(self.allocator, name, declared_type orelse expr_type);
         try self.emit(.{ .store = .{ .name = name, .declared_type = declared_type } });
     }
 
     /// print ( expr ) ;  — the identifier "print" is already consumed
     fn compilePrint(self: *Compiler) !void {
         _ = try self.expect(.l_paren);
-        try self.compileExpression(.r_paren);
+        _ = try self.compileExpression(.r_paren);
         _ = try self.expect(.semicolon);
         try self.emit(.print);
     }
 
     /// Shunting-yard over one expression, emitting instructions in RPN
-    /// order. Consumes the terminator: either `;`, or the `)` that closes
-    /// the expression when `terminator == .r_paren`.
-    fn compileExpression(self: *Compiler, terminator: Token.Tag) !void {
+    /// order and type-checking against the compile-time type stack.
+    /// Consumes the terminator: either `;`, or the `)` that closes the
+    /// expression when `terminator == .r_paren`. Returns the expression's
+    /// static type.
+    fn compileExpression(self: *Compiler, terminator: Token.Tag) !value_mod.Type {
         var op_stack = std.ArrayList(Token.Tag).empty;
         defer op_stack.deinit(self.allocator);
+
+        std.debug.assert(self.type_stack.items.len == 0);
+        defer self.type_stack.clearRetainingCapacity();
 
         var emitted_anything = false;
 
@@ -120,10 +138,14 @@ const Compiler = struct {
                     }
 
                     try self.emit(.{ .push_const = v });
+                    try self.type_stack.append(self.allocator, v.getType());
                     emitted_anything = true;
                 },
                 .identifier => {
-                    try self.emit(.{ .load = token.getValue(self.src) });
+                    const name = token.getValue(self.src);
+                    const t = self.var_types.get(name) orelse return error.UndefinedVariable;
+                    try self.emit(.{ .load = name });
+                    try self.type_stack.append(self.allocator, t);
                     emitted_anything = true;
                 },
                 .plus, .minus, .multiply, .divide, .caret => {
@@ -149,7 +171,7 @@ const Compiler = struct {
                     } else {
                         if (terminator == .r_paren) {
                             if (!emitted_anything) return error.ExpectedExpression;
-                            return;
+                            return self.finishExpression();
                         }
                         return error.UnmatchedParenthesis;
                     }
@@ -161,7 +183,7 @@ const Compiler = struct {
                         try self.emitOperator(top);
                     }
                     if (!emitted_anything) return error.ExpectedExpression;
-                    return;
+                    return self.finishExpression();
                 },
                 .eof => return error.UnexpectedEof,
                 else => return error.UnsupportedOperator,
@@ -169,7 +191,18 @@ const Compiler = struct {
         }
     }
 
+    /// A well-formed expression leaves exactly one value on the stack.
+    fn finishExpression(self: *Compiler) !value_mod.Type {
+        if (self.type_stack.items.len != 1) return error.InvalidExpression;
+        return self.type_stack.items[0];
+    }
+
     fn emitOperator(self: *Compiler, tag: Token.Tag) !void {
+        // statically mirror the VM's binary op: pop two, push unified type
+        const rhs = self.type_stack.pop() orelse return error.InvalidExpression;
+        const lhs = self.type_stack.pop() orelse return error.InvalidExpression;
+        try self.type_stack.append(self.allocator, value_mod.unify(lhs, rhs));
+
         try self.emit(switch (tag) {
             .plus => .add,
             .minus => .sub,
@@ -308,11 +341,33 @@ test "error: bad statement start" {
     try std.testing.expectError(error.UnexpectedToken, compile(std.testing.allocator, "5 + 5;"));
 }
 
-test "runtime error: undefined variable" {
-    const allocator = std.testing.allocator;
-    var aw = std.Io.Writer.Allocating.init(allocator);
-    defer aw.deinit();
-    try std.testing.expectError(error.UndefinedVariable, interpret(allocator, "print(nope);", &aw.writer));
+test "static error: undefined variable is caught at compile time" {
+    try std.testing.expectError(error.UndefinedVariable, compile(std.testing.allocator, "print(nope);"));
+    try std.testing.expectError(error.UndefinedVariable, compile(std.testing.allocator, "let x = y + 1;"));
+}
+
+test "static error: float expression into int annotation" {
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x:i32 = 1.5 + 1;"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let f = 1.5; let x:i8 = f;"));
+}
+
+test "static ok: int expression into float annotation" {
+    try interpretCapture("let x:f64 = 1 + 2; print(x);", "3\n");
+}
+
+test "static error: expression leaving more than one value" {
+    try std.testing.expectError(error.InvalidExpression, compile(std.testing.allocator, "let x = 1 2;"));
+}
+
+test "static error: operator missing an operand" {
+    try std.testing.expectError(error.InvalidExpression, compile(std.testing.allocator, "let x = 1 +;"));
+}
+
+test "static inference tracks variables across statements" {
+    // x is i8, so x + 1.5 is f64 and must not fit an i64 annotation
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x:i8 = 1; let y:i64 = x + 1.5;"));
+    // redeclaration updates the static type
+    try interpretCapture("let x = 1; let x = 1.5; let y:f64 = x; print(y);", "1.5\n");
 }
 
 test "runtime error: overflow on typed let" {

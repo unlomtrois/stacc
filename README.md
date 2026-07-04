@@ -1,6 +1,6 @@
 # Burn the Forest
 
-**Stacy** (`stacc`) is an experimental statically-typed language built around one constraint: no trees. No AST, no IR graph, no visitor passes. Source code compiles to typed stack-machine bytecode in a single O(n) forward pass, using the shunting-yard algorithm as the backbone.
+**Stacy** (`stacc`) is an experimental statically-typed language built around one constraint: no trees. No AST, no IR graph, no visitor passes. Source code compiles to typed stack-machine bytecode in a single O(n) forward pass, using the shunting-yard algorithm as the backbone, then lowers to native x86-64.
 
 ```
 fn fact(n:i64):i64 {
@@ -25,7 +25,7 @@ Compilation is a single forward pass: O(n) time, O(nesting depth) auxiliary memo
 ## The language
 
 ```
-# types: bool, i8, i32, i64, f64, str. Literals default to i64 (f64 with a dot)
+# scalar types: bool, i8, i32, i64, f64. Literals default to i64 (f64 with a dot)
 let x:i8 = 5 + 2;          # annotations coerce (range-checked)
 let y = x + 3;             # inference: i8 + i64 unifies to i64
 let z = 2:f64 / 8;         # typed literals promote the expression
@@ -55,9 +55,18 @@ add(str) fn head():i64 {   # attach methods to any type; `self` is implicit
 }
 print(s.head());           # method call: the receiver is already on the
                            # stack in first-argument position, so this is free
+
+type Point = { x:i64, y:i64 };
+let p:Point = (3, 4);      # tuple adopts Point, no runtime construction
+add(Point) fn sum():i64 {
+    return self.x + self.y;
+}
+print(p.sum());            # fields are static slot offsets
 ```
 
-Compound values follow the same principle as everything else: the type stack holds one entry (`str`), the value stack holds its two slots. Construction, `.len` and slicing are type-stack events plus a few register ops; a str variable's pointer and length get register-allocated independently.
+Compound values follow the same principle as everything else: the type stack holds one entry, and the value stack holds the flat scalar slots. `str` is two slots (`ptr`, `len`), `Point` is two `i64` slots, and nested structs flatten at declaration. Tuple construction emits nothing; adoption into a named struct is a relabel when the shapes match. Fields and tuple positions are static offsets, so the register allocator can color each slot independently.
+
+Modules are explicit. `use str;` enables the builtin text module. `use geometry;` splices `modules/geometry.stacy` into the token stream at the use site. Hybrid modules can declare `extern fn`s backed by native code; `net` is the first example.
 
 Checked at compile time: undefined variables and functions, float-into-int annotations, non-bool conditions, arity mismatches, arithmetic on bool, chained comparisons, malformed expressions (`1 2`, `1 +`). Integer narrowing stays a runtime range check on the actual value.
 
@@ -85,7 +94,7 @@ Recursive calls show the second kind of placeholder. A call site inside the func
   (patch call @12 slots -> 1)          <- patched at fn end
 ```
 
-The bytecode is fully typed, in the style of WASM: `i64.const 5`, `i32.add`, `i8.store x@0`, `f64.convert`. The VM never re-derives a type or looks up a name. Since instructions are self-describing and the frame layout and calling convention are already fixed, a future native backend could lower them instruction by instruction.
+The bytecode is fully typed, in the style of WASM: `i64.const 5`, `i32.add`, `i8.store x@0`, `f64.convert`. The VM never re-derives a type or looks up a name. Since instructions are self-describing and the frame layout and calling convention are fixed, the native backend lowers them instruction by instruction.
 
 ## Build & run
 
@@ -126,6 +135,7 @@ Consequences of the single pass, kept deliberately:
 - No all-paths-return analysis. A value-returning function that falls off the end is a runtime `error.MissingReturn` (`trap`), not a compile error.
 - Flat scoping per frame. No block scoping or definite-assignment analysis; a variable declared only inside a branch reads as zero-initialized after it. The VM checks operand types at runtime, so a static/runtime type divergence is an error rather than UB.
 - Declare before use, so no mutual recursion. Forward declarations would fix this and fit the single pass.
+- Modules share the global namespace. `use` is a capability manifest today, but there are no qualified module names yet.
 - Optimization passes that reorder across statements would want a graph. Constant folding would not.
 
 WASM validators handle all of the above while streaming, so none of these look fundamental.

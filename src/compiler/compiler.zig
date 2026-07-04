@@ -58,10 +58,17 @@ const Compiler = struct {
     /// compile-time mirror of the runtime value stack: holds the static
     /// type of every value the compiled code will have pushed so far
     type_stack: std.ArrayList(value_mod.Type) = .empty,
-    /// static types of declared variables
-    var_types: std.StringHashMapUnmanaged(value_mod.Type) = .empty,
+    /// compile-time symbol table: variable name -> slot index + static type.
+    /// Names never reach the VM; compiled code addresses flat slots.
+    var_types: std.StringHashMapUnmanaged(VarInfo) = .empty,
+    next_slot: u32 = 0,
     /// print type-checking steps to stderr while compiling
     trace: bool = false,
+
+    const VarInfo = struct {
+        slot: u32,
+        type: value_mod.Type,
+    };
 
     fn compileProgram(self: *Compiler) !void {
         while (true) {
@@ -103,8 +110,14 @@ const Compiler = struct {
             if (expr_type == .f64 and t != .f64) return error.TypeMismatch;
         }
         const var_type = declared_type orelse expr_type;
-        try self.var_types.put(self.allocator, name, var_type);
-        try self.emit(.{ .store = .{ .name = name, .type = var_type } });
+        // redeclaration reuses the slot and just updates the static type
+        const gop = try self.var_types.getOrPut(self.allocator, name);
+        if (!gop.found_existing) {
+            gop.value_ptr.slot = self.next_slot;
+            self.next_slot += 1;
+        }
+        gop.value_ptr.type = var_type;
+        try self.emit(.{ .store = .{ .name = name, .slot = gop.value_ptr.slot, .type = var_type } });
         if (self.trace) {
             if (declared_type) |t| {
                 if (t == expr_type) {
@@ -169,9 +182,9 @@ const Compiler = struct {
                 },
                 .identifier => {
                     const name = token.getValue(self.src);
-                    const t = self.var_types.get(name) orelse return error.UndefinedVariable;
-                    try self.type_stack.append(self.allocator, t);
-                    try self.emit(.{ .load = .{ .name = name, .type = t } });
+                    const info = self.var_types.get(name) orelse return error.UndefinedVariable;
+                    try self.type_stack.append(self.allocator, info.type);
+                    try self.emit(.{ .load = .{ .name = name, .slot = info.slot, .type = info.type } });
                     emitted_anything = true;
                 },
                 .plus, .minus, .multiply, .divide, .caret => {

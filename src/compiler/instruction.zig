@@ -18,28 +18,34 @@ pub const Instruction = union(enum) {
     print,
 
     pub const Load = struct {
+        /// original variable name, kept only for disassembly
         name: []const u8,
+        /// index into the VM's flat slot array
+        slot: u32,
         /// static type of the variable being loaded
         type: Type,
     };
 
     pub const Store = struct {
+        /// original variable name, kept only for disassembly
         name: []const u8,
+        /// index into the VM's flat slot array
+        slot: u32,
         /// resolved type: the declared annotation, or the inferred
         /// expression type. The VM coerces the stored value to it
         /// (range-checked when narrowing).
         type: Type,
     };
 
-    /// `{f}` formatter, e.g. `i64.const 5`, `i32.add`, `i8.store x`
+    /// `{f}` formatter, e.g. `i64.const 5`, `i32.add`, `i8.store x@0`
     pub fn format(self: Instruction, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .push_const => |v| {
                 try writer.print("{s}.const ", .{@tagName(v.getType())});
                 try v.write(writer);
             },
-            .load => |l| try writer.print("{s}.load {s}", .{ @tagName(l.type), l.name }),
-            .store => |s| try writer.print("{s}.store {s}", .{ @tagName(s.type), s.name }),
+            .load => |l| try writer.print("{s}.load {s}@{d}", .{ @tagName(l.type), l.name, l.slot }),
+            .store => |s| try writer.print("{s}.store {s}@{d}", .{ @tagName(s.type), s.name, s.slot }),
             .print => try writer.writeAll("print"),
             inline .add, .sub, .mul, .div, .pow => |t, op| try writer.print("{s}.{s}", .{ @tagName(t), @tagName(op) }),
         }

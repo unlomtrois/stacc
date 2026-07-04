@@ -8,34 +8,33 @@ const Instruction = @import("instruction.zig").Instruction;
 pub const Vm = struct {
     allocator: std.mem.Allocator,
     stack: std.ArrayList(Value),
-    vars: std.StringHashMapUnmanaged(Value),
+    slots: []Value,
     writer: *std.Io.Writer,
 
     pub fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer) Vm {
         return .{
             .allocator = allocator,
             .stack = .empty,
-            .vars = .empty,
+            .slots = &.{},
             .writer = writer,
         };
     }
 
     pub fn deinit(self: *Vm) void {
         self.stack.deinit(self.allocator);
-        self.vars.deinit(self.allocator);
+        self.allocator.free(self.slots);
     }
 
     pub fn run(self: *Vm, program: []const Instruction) !void {
+        try self.allocateSlots(program);
+
         for (program) |inst| {
             switch (inst) {
                 .push_const => |v| try self.stack.append(self.allocator, v),
-                .load => |l| {
-                    const v = self.vars.get(l.name) orelse return error.UndefinedVariable;
-                    try self.stack.append(self.allocator, v);
-                },
+                .load => |l| try self.stack.append(self.allocator, self.slots[l.slot]),
                 .store => |s| {
                     const v = try (try self.pop()).coerce(s.type);
-                    try self.vars.put(self.allocator, s.name, v);
+                    self.slots[s.slot] = v;
                 },
                 inline .add, .sub, .mul, .div, .pow => |t, op| try self.binaryOp(@field(BinOp, @tagName(op)), t),
                 .print => {
@@ -44,6 +43,25 @@ pub const Vm = struct {
                     try self.writer.writeByte('\n');
                 },
             }
+        }
+    }
+
+    /// One scan to size the flat slot array. The type checker guarantees
+    /// every load is preceded by its store, so slots start undefined-safe;
+    /// they are still zeroed defensively.
+    fn allocateSlots(self: *Vm, program: []const Instruction) !void {
+        var count: usize = 0;
+        for (program) |inst| {
+            switch (inst) {
+                .store => |s| count = @max(count, @as(usize, s.slot) + 1),
+                .load => |l| count = @max(count, @as(usize, l.slot) + 1),
+                else => {},
+            }
+        }
+        if (count > self.slots.len) {
+            self.allocator.free(self.slots);
+            self.slots = try self.allocator.alloc(Value, count);
+            @memset(self.slots, .{ .i64 = 0 });
         }
     }
 
@@ -111,24 +129,14 @@ test "arithmetic and print" {
 test "store and load roundtrip with annotation" {
     try runCapture(&.{
         .{ .push_const = .{ .i64 = 7 } },
-        .{ .store = .{ .name = "x", .type = .i8 } },
-        .{ .load = .{ .name = "x", .type = .i8 } },
+        .{ .store = .{ .name = "x", .slot = 0, .type = .i8 } },
+        .{ .load = .{ .name = "x", .slot = 0, .type = .i8 } },
         .{ .push_const = .{ .i64 = 3 } },
         .{ .add = .i64 },
-        .{ .store = .{ .name = "y", .type = .i64 } },
-        .{ .load = .{ .name = "y", .type = .i64 } },
+        .{ .store = .{ .name = "y", .slot = 1, .type = .i64 } },
+        .{ .load = .{ .name = "y", .slot = 1, .type = .i64 } },
         .print,
     }, "10\n");
-}
-
-test "undefined variable" {
-    const allocator = std.testing.allocator;
-    var aw = std.Io.Writer.Allocating.init(allocator);
-    defer aw.deinit();
-    var vm = Vm.init(allocator, &aw.writer);
-    defer vm.deinit();
-
-    try std.testing.expectError(error.UndefinedVariable, vm.run(&.{.{ .load = .{ .name = "nope", .type = .i64 } }}));
 }
 
 test "overflow on typed store" {
@@ -140,7 +148,7 @@ test "overflow on typed store" {
 
     try std.testing.expectError(error.Overflow, vm.run(&.{
         .{ .push_const = .{ .i64 = 300 } },
-        .{ .store = .{ .name = "x", .type = .i8 } },
+        .{ .store = .{ .name = "x", .slot = 0, .type = .i8 } },
     }));
 }
 

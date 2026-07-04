@@ -11,6 +11,8 @@ const keywords = std.StaticStringMap(Token.Tag).initComptime(.{
     .{ "while", .keyword_while },
     .{ "fn", .keyword_fn },
     .{ "return", .keyword_return },
+    .{ "use", .keyword_use },
+    .{ "type", .keyword_type },
 });
 
 const UTF8_BOM_SEQUENCE = "\xEF\xBB\xBF";
@@ -390,21 +392,21 @@ test "UTF-8 strings" {
 test "control flow keywords" {
     const src = "if (x) { } else { } while (x) { }";
     try helper(src, &[_]Token.Tag{
-        .keyword_if,    .l_paren, .identifier, .r_paren, .l_brace, .r_brace,
-        .keyword_else,  .l_brace, .r_brace,
-        .keyword_while, .l_paren, .identifier, .r_paren, .l_brace, .r_brace,
+        .keyword_if,   .l_paren, .identifier, .r_paren,       .l_brace, .r_brace,
+        .keyword_else, .l_brace, .r_brace,    .keyword_while, .l_paren, .identifier,
+        .r_paren,      .l_brace, .r_brace,
     });
 }
 
 test "function keywords and comma" {
     const src = "fn add(a:i64, b:i64):i64 { return a; }";
     try helper(src, &[_]Token.Tag{
-        .keyword_fn,     .identifier, .l_paren,
-        .identifier,     .colon,      .identifier,
-        .comma,          .identifier, .colon,
-        .identifier,     .r_paren,    .colon,
-        .identifier,     .l_brace,    .keyword_return,
-        .identifier,     .semicolon,  .r_brace,
+        .keyword_fn, .identifier, .l_paren,
+        .identifier, .colon,      .identifier,
+        .comma,      .identifier, .colon,
+        .identifier, .r_paren,    .colon,
+        .identifier, .l_brace,    .keyword_return,
+        .identifier, .semicolon,  .r_brace,
     });
 }
 
@@ -426,6 +428,14 @@ test "float literals" {
 test "dot after number without digit is not a float" {
     const src = "5.foo";
     try helper(src, &[_]Token.Tag{ .literal_number, .dot, .identifier });
+}
+
+test "module keywords" {
+    try helper("use str; type byte = i8;", &[_]Token.Tag{
+        .keyword_use,  .identifier, .semicolon,
+        .keyword_type, .identifier, .equal,
+        .identifier,   .semicolon,
+    });
 }
 
 test "dot dot for slice ranges" {

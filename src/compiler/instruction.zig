@@ -69,6 +69,8 @@ pub const Instruction = union(enum) {
 
     pub const FnPrologue = struct {
         name: []const u8,
+        /// receiver type name for methods (`add(str) fn ...`), else ""
+        owner: []const u8 = "",
         num_params: u32,
         num_slots: u32,
         returns_value: bool,
@@ -77,6 +79,8 @@ pub const Instruction = union(enum) {
     pub const Call = struct {
         /// callee name, kept only for disassembly
         name: []const u8,
+        /// receiver type name for method calls, else ""
+        owner: []const u8 = "",
         /// entry pc of the function body
         target: usize,
         num_params: u32,
@@ -117,8 +121,20 @@ pub const Instruction = union(enum) {
             .store => |s| try writer.print("{s}.store {s}@{d}", .{ @tagName(s.type), s.name, s.slot }),
             .print => |t| try writer.print("{s}.print", .{@tagName(t)}),
             .enter => |n| try writer.print("enter {d}", .{n}),
-            .fn_prologue => |f| try writer.print("fn {s} ({d} params, {d} slots)", .{ f.name, f.num_params, f.num_slots }),
-            .call => |c| try writer.print("call {s} -> {d} ({d} params, {d} slots)", .{ c.name, c.target, c.num_params, c.num_slots }),
+            .fn_prologue => |f| {
+                if (f.owner.len > 0) {
+                    try writer.print("fn {s}.{s} ({d} params, {d} slots)", .{ f.owner, f.name, f.num_params, f.num_slots });
+                } else {
+                    try writer.print("fn {s} ({d} params, {d} slots)", .{ f.name, f.num_params, f.num_slots });
+                }
+            },
+            .call => |c| {
+                if (c.owner.len > 0) {
+                    try writer.print("call {s}.{s} -> {d} ({d} params, {d} slots)", .{ c.owner, c.name, c.target, c.num_params, c.num_slots });
+                } else {
+                    try writer.print("call {s} -> {d} ({d} params, {d} slots)", .{ c.name, c.target, c.num_params, c.num_slots });
+                }
+            },
             .ret => |has_value| try writer.writeAll(if (has_value) "ret value" else "ret"),
             .trap => try writer.writeAll("trap"),
             .pop => try writer.writeAll("pop"),

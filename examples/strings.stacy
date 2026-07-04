@@ -1,24 +1,42 @@
-# str: a two-slot fat value (pointer, length) into static data.
-# construction, len, indexing, slicing and equality are all
-# bounds-checked; none of it allocates.
+# str is a module, not a built-in: enable it explicitly.
+use str;
 
+# a two-slot fat value (pointer, length) into static data; everything
+# below is bounds-checked and none of it allocates.
 let greeting = "hello, stacy";
 print(greeting);
-print(greeting.len);          # 12
+print(greeting.len());        # 12: len() is an intrinsic method
 
 let word = greeting[7..12];   # a view, no copy
 print(word);                  # stacy
 print(word == "stacy");       # true
 print(greeting[0]);           # 104, the byte 'h'
 
+# attach your own methods; `self` is the implicit receiver
+add(str) fn head():i64 {
+    return self[0];
+}
+add(str) fn at(i:i64):i64 {
+    return self[i];
+}
+print(word.head());           # 115, 's'
+print(word.at(4));            # 121, 'y'
+
+# methods work on any type (receivers are exact-typed), aliases are cheap
+add(i64) fn double():i64 {
+    return self * 2;
+}
+type count = i64;
+let b:count = 21;
+print(b.double());            # 42
+print((b + 100).double());    # 242: postfix chains onto parens
+
 fn shout(s:str) {             # str parameters take two slots
     print(s);
-    print(s.len);
+    print(s.len());
 }
 shout(word);
-shout("postfix"[0..4]);       # chains work on literals too
 
-# slices with dynamic bounds
 let i = 0;
 while (i < 3) {
     print(greeting[0..i + 2]);

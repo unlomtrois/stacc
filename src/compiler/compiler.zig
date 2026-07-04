@@ -11,6 +11,7 @@ const Value = value_mod.Value;
 const instruction_mod = @import("instruction.zig");
 pub const Instruction = instruction_mod.Instruction;
 pub const Vm = @import("vm.zig").Vm;
+const modules = @import("../modules/registry.zig");
 
 /// Compile source into a flat instruction list. Variable names in the
 /// returned instructions are slices into `src`.
@@ -40,6 +41,16 @@ fn compileInner(allocator: std.mem.Allocator, src: []const u8, trace: bool) ![]I
         while (it.next()) |info| allocator.free(info.params);
         compiler.fn_table.deinit(allocator);
     }
+    defer compiler.enabled_modules.deinit(allocator);
+    defer compiler.type_aliases.deinit(allocator);
+    defer {
+        var it = compiler.methods.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.params);
+        }
+        compiler.methods.deinit(allocator);
+    }
 
     // instruction 0 reserves the top-level frame; its size is known
     // only at end of compilation, so backpatch it
@@ -65,8 +76,10 @@ const Compiler = struct {
     src: []const u8,
     lexer: Lexer,
     instructions: std.ArrayList(Instruction),
-    /// one-token pushback buffer, filled by peeking past a literal
-    peeked: ?Token = null,
+    /// small LIFO pushback buffer (bounded lookahead, e.g. for the
+    /// contextual `add(type) fn` form)
+    pushback: [4]Token = undefined,
+    pushback_len: u8 = 0,
     /// compile-time mirror of the runtime value stack: holds the static
     /// type of every value the compiled code will have pushed so far
     type_stack: std.ArrayList(value_mod.Type) = .empty,
@@ -90,6 +103,14 @@ const Compiler = struct {
     /// which token ended the last compileExpression (.comma or .r_paren
     /// matter, for argument lists)
     last_terminator: Token.Tag = .eof,
+    /// modules enabled by `use name;` (keys are the registry's static
+    /// module names)
+    enabled_modules: std.StringHashMapUnmanaged(void) = .empty,
+    /// `type name = ...;` aliases
+    type_aliases: std.StringHashMapUnmanaged(value_mod.Type) = .empty,
+    /// user methods attached with `add(type) fn ...`, keyed by the
+    /// mangled "type.name" (keys owned by the compiler)
+    methods: std.StringHashMapUnmanaged(FnInfo) = .empty,
 
     const VarInfo = struct {
         slot: u32,
@@ -132,6 +153,8 @@ const Compiler = struct {
         ReturnOutsideFunction,
         UnknownField,
         UnsupportedType,
+        UnknownModule,
+        ModuleNotEnabled,
     };
 
     fn compileProgram(self: *Compiler) Error!void {
@@ -161,14 +184,18 @@ const Compiler = struct {
             .keyword_let => try self.compileLet(),
             .keyword_if => try self.compileIf(),
             .keyword_while => try self.compileWhile(),
-            .keyword_fn => try self.compileFn(),
+            .keyword_fn => try self.compileFn(null),
             .keyword_return => try self.compileReturn(),
+            .keyword_use => try self.compileUse(),
+            .keyword_type => try self.compileTypeAlias(),
             .identifier => {
                 const name = token.getValue(self.src);
                 const after = self.next();
                 if (after.tag == .l_paren) {
                     if (std.mem.eql(u8, name, "print")) {
                         try self.compilePrint();
+                    } else if (std.mem.eql(u8, name, "add") and try self.tryCompileMethodDef()) {
+                        // `add(type) fn name(...)` attached a method
                     } else {
                         // call statement; a leftover return value is dropped
                         const return_type = try self.compileCall(name);
@@ -179,7 +206,7 @@ const Compiler = struct {
                         }
                     }
                 } else {
-                    self.peeked = after;
+                    self.pushBack(after);
                     try self.compileAssign(name);
                 }
             },
@@ -193,12 +220,22 @@ const Compiler = struct {
     /// flow jumps over it. The signature is registered before the body so
     /// recursive calls resolve; only the frame size of those calls needs
     /// backpatching afterwards.
-    fn compileFn(self: *Compiler) Error!void {
+    fn compileFn(self: *Compiler, receiver: ?value_mod.Type) Error!void {
         if (self.in_function or self.block_depth > 0) return error.UnexpectedToken;
 
         const name_token = try self.expect(.identifier);
         const name = name_token.getValue(self.src);
-        if (self.fn_table.contains(name)) return error.DuplicateDefinition;
+        const owner: []const u8 = if (receiver) |r| @tagName(r) else "";
+        if (receiver) |r| {
+            // a method must not collide with another method or a module
+            // intrinsic on the same type
+            if (self.findIntrinsic(r, name) != null) return error.DuplicateDefinition;
+            var key_buf: [128]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ owner, name }) catch return error.UnknownField;
+            if (self.methods.contains(key)) return error.DuplicateDefinition;
+        } else {
+            if (self.fn_table.contains(name)) return error.DuplicateDefinition;
+        }
         _ = try self.expect(.l_paren);
 
         // fresh frame scope: params take slots 0..n-1
@@ -216,16 +253,23 @@ const Compiler = struct {
         var params: std.ArrayList(value_mod.Type) = .empty;
         errdefer params.deinit(self.allocator);
 
+        // methods receive the value they were called on as an implicit
+        // first parameter named `self`
+        if (receiver) |r| {
+            try self.var_types.put(self.allocator, "self", .{ .slot = 0, .type = r });
+            self.next_slot += value_mod.width(r);
+            try params.append(self.allocator, r);
+        }
+
         var token = self.next();
         if (token.tag != .r_paren) {
-            self.peeked = token;
+            self.pushBack(token);
             while (true) {
                 const param_name_token = try self.expect(.identifier);
                 const param_name = param_name_token.getValue(self.src);
                 _ = try self.expect(.colon);
                 const type_token = try self.expect(.identifier);
-                const param_type = value_mod.type_names.get(type_token.getValue(self.src)) orelse
-                    return error.UnknownType;
+                const param_type = try self.resolveType(type_token.getValue(self.src));
 
                 const gop = try self.var_types.getOrPut(self.allocator, param_name);
                 if (gop.found_existing) return error.DuplicateDefinition;
@@ -243,8 +287,7 @@ const Compiler = struct {
         token = self.next();
         if (token.tag == .colon) {
             const type_token = try self.expect(.identifier);
-            return_type = value_mod.type_names.get(type_token.getValue(self.src)) orelse
-                return error.UnknownType;
+            return_type = try self.resolveType(type_token.getValue(self.src));
             // v1: native returns pass through a single register
             if (return_type == .str) return error.UnsupportedType;
             token = self.next();
@@ -257,22 +300,34 @@ const Compiler = struct {
 
         const entry = self.instructions.items.len;
         const param_slots = self.next_slot; // params were registered first
-        try self.fn_table.put(self.allocator, name, .{
+        const info_value = FnInfo{
             .entry = entry,
             .params = try params.toOwnedSlice(self.allocator),
             .param_slots = param_slots,
             .return_type = return_type,
             .num_slots = 0,
             .finalized = false,
-        });
+        };
+        if (receiver != null) {
+            const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ owner, name });
+            errdefer self.allocator.free(key);
+            try self.methods.put(self.allocator, key, info_value);
+        } else {
+            try self.fn_table.put(self.allocator, name, info_value);
+        }
         if (self.trace) {
-            std.debug.print("── fn {s} @{d} ──\n", .{ name, entry });
+            if (receiver != null) {
+                std.debug.print("── add({s}) fn {s} @{d} ──\n", .{ owner, name, entry });
+            } else {
+                std.debug.print("── fn {s} @{d} ──\n", .{ name, entry });
+            }
         }
         // frame-shape marker for native codegen (a VM no-op); its
         // num_slots is patched below, together with the recursive calls.
         // num_params counts SLOTS (a str parameter is two).
         try self.emit(.{ .fn_prologue = .{
             .name = name,
+            .owner = owner,
             .num_params = param_slots,
             .num_slots = 0,
             .returns_value = return_type != null,
@@ -292,7 +347,11 @@ const Compiler = struct {
         }
 
         // finalize the frame size; patch the prologue and recursive call sites
-        const info = self.fn_table.getPtr(name).?;
+        const info = if (receiver != null) blk: {
+            var key_buf: [128]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ owner, name }) catch unreachable;
+            break :blk self.methods.getPtr(key).?;
+        } else self.fn_table.getPtr(name).?;
         info.num_slots = self.next_slot;
         info.finalized = true;
         self.instructions.items[entry].fn_prologue.num_slots = info.num_slots;
@@ -323,7 +382,7 @@ const Compiler = struct {
             try self.emit(.{ .ret = false });
             return;
         }
-        self.peeked = token;
+        self.pushBack(token);
 
         const return_type = self.current_return_type orelse
             return error.TypeMismatch; // void function returning a value
@@ -344,13 +403,27 @@ const Compiler = struct {
     /// type stack gains it for value-returning callees.
     fn compileCall(self: *Compiler, name: []const u8) Error!?value_mod.Type {
         const info = self.fn_table.getPtr(name) orelse return error.UndefinedFunction;
+        return self.compileCallCommon(info, name, "", 0);
+    }
 
-        var arg_count: usize = 0;
+    /// receiver.name(args) — the receiver value is already on the stack
+    /// (which is exactly where the implicit `self` parameter goes).
+    fn compileMethodCall(self: *Compiler, receiver: value_mod.Type, name: []const u8) Error!?value_mod.Type {
+        var key_buf: [128]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ @tagName(receiver), name }) catch return error.UnknownField;
+        const info = self.methods.getPtr(key) orelse return error.UnknownField;
+        return self.compileCallCommon(info, name, @tagName(receiver), 1);
+    }
+
+    /// Shared call emission. `pre_pushed` counts values already on the
+    /// stack that fill the leading parameters (the method receiver).
+    fn compileCallCommon(self: *Compiler, info: *FnInfo, name: []const u8, owner: []const u8, pre_pushed: usize) Error!?value_mod.Type {
+        var arg_count: usize = pre_pushed;
         const first = self.next();
         if (first.tag == .r_paren) {
             // no arguments
         } else {
-            self.peeked = first;
+            self.pushBack(first);
             while (true) {
                 const arg_type = try self.compileExpression(.comma);
                 if (arg_count >= info.params.len) return error.ArgumentCountMismatch;
@@ -367,7 +440,7 @@ const Compiler = struct {
         }
         if (arg_count != info.params.len) return error.ArgumentCountMismatch;
 
-        // the call consumes the arguments and produces the return value
+        // the call consumes receiver + arguments and produces the return value
         self.type_stack.shrinkRetainingCapacity(self.type_stack.items.len - arg_count);
         if (info.return_type) |t| {
             try self.type_stack.append(self.allocator, t);
@@ -375,6 +448,7 @@ const Compiler = struct {
         const call_index = self.instructions.items.len;
         try self.emit(.{ .call = .{
             .name = name,
+            .owner = owner,
             .target = info.entry,
             .num_params = info.param_slots,
             .num_slots = info.num_slots,
@@ -384,6 +458,91 @@ const Compiler = struct {
             try self.pending_calls.append(self.allocator, call_index);
         }
         return info.return_type;
+    }
+
+    /// use name; — enable a built-in module (top level only).
+    fn compileUse(self: *Compiler) Error!void {
+        if (self.in_function or self.block_depth > 0) return error.UnexpectedToken;
+        const name_token = try self.expect(.identifier);
+        const module = modules.find(name_token.getValue(self.src)) orelse return error.UnknownModule;
+        _ = try self.expect(.semicolon);
+        try self.enabled_modules.put(self.allocator, module.name, {});
+    }
+
+    /// type name = existing_type; — an alias (top level only).
+    fn compileTypeAlias(self: *Compiler) Error!void {
+        if (self.in_function or self.block_depth > 0) return error.UnexpectedToken;
+        const name_token = try self.expect(.identifier);
+        const name = name_token.getValue(self.src);
+        _ = try self.expect(.equal);
+        const target_token = try self.expect(.identifier);
+        const target = try self.resolveType(target_token.getValue(self.src));
+        _ = try self.expect(.semicolon);
+        const gop = try self.type_aliases.getOrPut(self.allocator, name);
+        if (gop.found_existing) return error.DuplicateDefinition;
+        gop.value_ptr.* = target;
+    }
+
+    /// `add` was consumed and `(` too; if what follows matches
+    /// `type) fn`, this is a method attachment. Otherwise the tokens go
+    /// back and the caller treats `add` as a plain function call.
+    fn tryCompileMethodDef(self: *Compiler) Error!bool {
+        if (self.in_function or self.block_depth > 0) return false;
+        const t1 = self.next();
+        if (t1.tag != .identifier) {
+            self.pushBack(t1);
+            return false;
+        }
+        const t2 = self.next();
+        if (t2.tag != .r_paren) {
+            self.pushBack(t2);
+            self.pushBack(t1);
+            return false;
+        }
+        const t3 = self.next();
+        if (t3.tag != .keyword_fn) {
+            self.pushBack(t3);
+            self.pushBack(t2);
+            self.pushBack(t1);
+            return false;
+        }
+        const receiver = try self.resolveType(t1.getValue(self.src));
+        try self.compileFn(receiver);
+        return true;
+    }
+
+    /// Resolve a type name through aliases and module gates.
+    fn resolveType(self: *Compiler, name: []const u8) Error!value_mod.Type {
+        if (self.type_aliases.get(name)) |t| return t;
+        const t = value_mod.type_names.get(name) orelse return error.UnknownType;
+        for (&modules.builtin) |*module| {
+            if (module.provides_type == t and !self.enabled_modules.contains(module.name)) {
+                return error.ModuleNotEnabled;
+            }
+        }
+        return t;
+    }
+
+    fn stringLiteralsEnabled(self: *Compiler) bool {
+        var it = self.enabled_modules.keyIterator();
+        while (it.next()) |name| {
+            if (modules.find(name.*).?.provides_string_literals) return true;
+        }
+        return false;
+    }
+
+    /// Intrinsic methods provided by enabled modules.
+    fn findIntrinsic(self: *Compiler, receiver: value_mod.Type, name: []const u8) ?modules.IntrinsicMethod {
+        var it = self.enabled_modules.keyIterator();
+        while (it.next()) |module_name| {
+            const module = modules.find(module_name.*).?;
+            for (module.intrinsics) |intrinsic| {
+                if (intrinsic.receiver == receiver and std.mem.eql(u8, intrinsic.name, name)) {
+                    return intrinsic;
+                }
+            }
+        }
+        return null;
     }
 
     /// if ( cond ) { ... } [ else { ... } | else if ... ]
@@ -412,7 +571,7 @@ const Compiler = struct {
             }
             self.patch(jmp, self.instructions.items.len);
         } else {
-            self.peeked = after; // not ours; push it back
+            self.pushBack(after); // not ours; push it back
             self.patch(jif, self.instructions.items.len);
         }
     }
@@ -475,8 +634,7 @@ const Compiler = struct {
         var token = self.next();
         if (token.tag == .colon) {
             const type_token = try self.expect(.identifier);
-            declared_type = value_mod.type_names.get(type_token.getValue(self.src)) orelse
-                return error.UnknownType;
+            declared_type = try self.resolveType(type_token.getValue(self.src));
             token = self.next();
         }
         if (token.tag != .equal) return error.UnexpectedToken;
@@ -566,11 +724,10 @@ const Compiler = struct {
                     const after = self.next();
                     if (after.tag == .colon) {
                         const type_token = try self.expect(.identifier);
-                        const t = value_mod.type_names.get(type_token.getValue(self.src)) orelse
-                            return error.UnknownType;
+                        const t = try self.resolveType(type_token.getValue(self.src));
                         v = try v.coerce(t);
                     } else {
-                        self.peeked = after;
+                        self.pushBack(after);
                     }
 
                     try self.type_stack.append(self.allocator, v.getType());
@@ -585,7 +742,7 @@ const Compiler = struct {
                         const return_type = try self.compileCall(name);
                         if (return_type == null) return error.TypeMismatch; // void call has no value
                     } else {
-                        self.peeked = after;
+                        self.pushBack(after);
                         const info = self.var_types.get(name) orelse return error.UndefinedVariable;
                         try self.type_stack.append(self.allocator, info.type);
                         try self.emit(.{ .load = .{ .name = name, .slot = info.slot, .type = info.type } });
@@ -594,6 +751,7 @@ const Compiler = struct {
                     emitted_anything = true;
                 },
                 .literal_string => {
+                    if (!self.stringLiteralsEnabled()) return error.ModuleNotEnabled;
                     const quoted = token.getValue(self.src);
                     const bytes = quoted[1 .. quoted.len - 1]; // strip the quotes
                     try self.type_stack.append(self.allocator, .str);
@@ -628,10 +786,19 @@ const Compiler = struct {
                 .r_paren => {
                     // pop until the matching '('; if there is none, this ')'
                     // terminates a print(...) expression
+                    var closed_group = false;
                     while (op_stack.items.len > 0) {
                         const top = op_stack.pop().?;
-                        if (top == .l_paren) break;
+                        if (top == .l_paren) {
+                            closed_group = true;
+                            break;
+                        }
                         try self.emitOperator(top);
+                    }
+                    if (closed_group) {
+                        // postfix chains onto a parenthesized value:
+                        // (x + 1).double()
+                        try self.compilePostfix();
                     } else {
                         if (terminator == .r_paren or terminator == .comma) {
                             if (!emitted_anything) return error.ExpectedExpression;
@@ -694,12 +861,24 @@ const Compiler = struct {
             const token = self.next();
             switch (token.tag) {
                 .dot => {
-                    const field = try self.expect(.identifier);
-                    if (!std.mem.eql(u8, field.getValue(self.src), "len")) return error.UnknownField;
-                    if (self.typeStackTop() != .str) return error.TypeMismatch;
-                    _ = self.type_stack.pop();
-                    try self.type_stack.append(self.allocator, .i64);
-                    try self.emit(.str_len);
+                    // method call: receiver.name(args). The receiver is
+                    // already on the stack, which is exactly first-argument
+                    // position, so method syntax costs nothing.
+                    const name_token = try self.expect(.identifier);
+                    const method_name = name_token.getValue(self.src);
+                    _ = try self.expect(.l_paren);
+                    const receiver = self.typeStackTop() orelse return error.InvalidExpression;
+                    if (self.findIntrinsic(receiver, method_name)) |intrinsic| {
+                        _ = try self.expect(.r_paren); // intrinsics take no arguments
+                        _ = self.type_stack.pop();
+                        try self.type_stack.append(self.allocator, intrinsic.return_type);
+                        switch (intrinsic.intrinsic) {
+                            .str_len => try self.emit(.str_len),
+                        }
+                    } else {
+                        const return_type = try self.compileMethodCall(receiver, method_name);
+                        if (return_type == null) return error.TypeMismatch; // void method in expression
+                    }
                 },
                 .l_bracket => {
                     if (self.typeStackTop() != .str) return error.TypeMismatch;
@@ -724,7 +903,7 @@ const Compiler = struct {
                     }
                 },
                 else => {
-                    self.peeked = token;
+                    self.pushBack(token);
                     return;
                 },
             }
@@ -820,15 +999,25 @@ const Compiler = struct {
     }
 
     fn next(self: *Compiler) Token {
-        if (self.peeked) |token| {
-            self.peeked = null;
-            return token;
+        if (self.pushback_len > 0) {
+            self.pushback_len -= 1;
+            return self.pushback[self.pushback_len];
         }
+        return self.nextFromLexer();
+    }
+
+    fn nextFromLexer(self: *Compiler) Token {
         return self.lexer.next() orelse Token{
             .start = self.src.len,
             .end = self.src.len,
             .tag = .eof,
         };
+    }
+
+    fn pushBack(self: *Compiler, token: Token) void {
+        std.debug.assert(self.pushback_len < self.pushback.len);
+        self.pushback[self.pushback_len] = token;
+        self.pushback_len += 1;
     }
 
     fn expect(self: *Compiler, tag: Token.Tag) !Token {
@@ -1348,37 +1537,38 @@ test "runtime error: argument narrowing overflow" {
 // ── strings ────────────────────────────────────────────────────────
 
 test "string literals, print, len" {
-    try interpretCapture("print(\"hello\");", "hello\n");
-    try interpretCapture("let s = \"hello\"; print(s.len);", "5\n");
-    try interpretCapture("print(\"\".len);", "0\n");
+    try interpretCapture("use str; print(\"hello\");", "hello\n");
+    try interpretCapture("use str; let s = \"hello\"; print(s.len());", "5\n");
+    try interpretCapture("use str; print(\"\".len());", "0\n");
 }
 
 test "string indexing and slicing" {
-    try interpretCapture("print(\"abc\"[1]);", "98\n");
-    try interpretCapture("let s = \"hello, stacy\"; print(s[7..12]);", "stacy\n");
-    try interpretCapture("print(\"chain\"[1..4].len);", "3\n"); // postfix chains
-    try interpretCapture("let s = \"abcdef\"; let i = 2; print(s[i..i + 3]);", "cde\n"); // dynamic bounds
-    try interpretCapture("print(\"abc\"[1:i8]);", "98\n"); // index coerces to i64
+    try interpretCapture("use str; print(\"abc\"[1]);", "98\n");
+    try interpretCapture("use str; let s = \"hello, stacy\"; print(s[7..12]);", "stacy\n");
+    try interpretCapture("use str; print(\"chain\"[1..4].len());", "3\n"); // postfix chains
+    try interpretCapture("use str; let s = \"abcdef\"; let i = 2; print(s[i..i + 3]);", "cde\n"); // dynamic bounds
+    try interpretCapture("use str; print(\"abc\"[1:i8]);", "98\n"); // index coerces to i64
 }
 
 test "string equality is by content" {
-    try interpretCapture("print(\"abc\" == \"abc\");", "true\n");
-    try interpretCapture("print(\"abc\" == \"abd\");", "false\n");
-    try interpretCapture("print(\"abc\" != \"ab\");", "true\n");
-    try interpretCapture("let s = \"xy\"; let t = \"x\"; print(s[0..1] == t);", "true\n");
-    try interpretCapture("let s = \"go\"; if (s == \"go\") { print(1); }", "1\n");
+    try interpretCapture("use str; print(\"abc\" == \"abc\");", "true\n");
+    try interpretCapture("use str; print(\"abc\" == \"abd\");", "false\n");
+    try interpretCapture("use str; print(\"abc\" != \"ab\");", "true\n");
+    try interpretCapture("use str; let s = \"xy\"; let t = \"x\"; print(s[0..1] == t);", "true\n");
+    try interpretCapture("use str; let s = \"go\"; if (s == \"go\") { print(1); }", "1\n");
 }
 
 test "str variables and parameters occupy two slots" {
     const allocator = std.testing.allocator;
-    const program = try compile(allocator, "let s = \"hi\"; let x = 1; print(x);");
+    const program = try compile(allocator, "use str; let s = \"hi\"; let x = 1; print(x);");
     defer allocator.free(program);
     // s takes slots 0..1 and x slot 2, so the frame is 3 slots
     try std.testing.expectEqual(Instruction{ .enter = 3 }, program[0]);
 
     try interpretCapture(
+        \\use str;
         \\fn middle(s:str, fallback:i64):i64 {
-        \\    if (s.len > 2) { return s[1]; }
+        \\    if (s.len() > 2) { return s[1]; }
         \\    return fallback;
         \\}
         \\print(middle("abc", 0));
@@ -1387,32 +1577,96 @@ test "str variables and parameters occupy two slots" {
 }
 
 test "static error: strings do not mix with numbers" {
-    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = \"a\" + 1;"));
-    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = \"a\" + \"b\";"));
-    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = \"a\" < \"b\";"));
-    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = \"a\" == 1;"));
-    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x:i64 = \"a\";"));
-    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let s:str = 1;"));
-    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "if (\"a\") { }"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "use str; let x = \"a\" + 1;"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "use str; let x = \"a\" + \"b\";"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "use str; let x = \"a\" < \"b\";"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "use str; let x = \"a\" == 1;"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "use str; let x:i64 = \"a\";"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "use str; let s:str = 1;"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "use str; if (\"a\") { }"));
 }
 
 test "static error: bad postfix" {
-    try std.testing.expectError(error.UnknownField, compile(std.testing.allocator, "print(\"a\".size);"));
-    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "let x = 1; print(x[0]);"));
-    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "print(\"abc\"[1.5]);"));
-    try std.testing.expectError(error.UnexpectedToken, compile(std.testing.allocator, "print(\"abc\"[1..2..3]);"));
+    try std.testing.expectError(error.UnknownField, compile(std.testing.allocator, "use str; print(\"a\".size());"));
+    // field-style access without a call is not a thing (yet)
+    try std.testing.expectError(error.UnexpectedToken, compile(std.testing.allocator, "use str; print(\"a\".len);"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "use str; let x = 1; print(x[0]);"));
+    try std.testing.expectError(error.TypeMismatch, compile(std.testing.allocator, "use str; print(\"abc\"[1.5]);"));
+    try std.testing.expectError(error.UnexpectedToken, compile(std.testing.allocator, "use str; print(\"abc\"[1..2..3]);"));
 }
 
 test "static error: str return type is not supported yet" {
-    try std.testing.expectError(error.UnsupportedType, compile(std.testing.allocator, "fn f():str { return \"a\"; }"));
+    try std.testing.expectError(error.UnsupportedType, compile(std.testing.allocator, "use str; fn f():str { return \"a\"; }"));
+}
+
+// ── modules, methods, aliases ──────────────────────────────────────
+
+test "str is gated behind use str" {
+    try std.testing.expectError(error.ModuleNotEnabled, compile(std.testing.allocator, "print(\"hello\");"));
+    try std.testing.expectError(error.ModuleNotEnabled, compile(std.testing.allocator, "let s:str = \"x\";"));
+    try std.testing.expectError(error.ModuleNotEnabled, compile(std.testing.allocator, "fn f(s:str) { }"));
+    try std.testing.expectError(error.UnknownModule, compile(std.testing.allocator, "use regex;"));
+    // use is idempotent and top-level only
+    try interpretCapture("use str; use str; print(\"ok\");", "ok\n");
+    try std.testing.expectError(error.UnexpectedToken, compile(std.testing.allocator, "if (1 < 2) { use str; }"));
+}
+
+test "user methods attach with add(type) fn and an implicit self" {
+    try interpretCapture(
+        \\use str;
+        \\add(str) fn head():i64 {
+        \\    return self[0];
+        \\}
+        \\add(str) fn at(i:i64):i64 {
+        \\    return self[i];
+        \\}
+        \\let s = "stacy";
+        \\print(s.head());
+        \\print(s.at(1));
+        \\print("chained"[1..4].head());
+    , "115\n116\n104\n");
+}
+
+test "methods work on numeric types too" {
+    try interpretCapture(
+        \\add(i64) fn double():i64 {
+        \\    return self * 2;
+        \\}
+        \\let x = 21;
+        \\print(x.double());
+        \\print((x + 1).double());
+    , "42\n44\n");
+}
+
+test "a function named add still works" {
+    try interpretCapture(
+        \\fn add(a:i64, b:i64):i64 { return a + b; }
+        \\let x = 1;
+        \\add(x, 2);
+        \\print(add(x, 2));
+    , "3\n");
+}
+
+test "type aliases" {
+    try interpretCapture("type byte = i8; let x:byte = 100; print(x);", "100\n");
+    try interpretCapture("use str; type text = str; let t:text = \"hi\"; print(t.len());", "2\n");
+    try std.testing.expectError(error.ModuleNotEnabled, compile(std.testing.allocator, "type text = str;"));
+    try std.testing.expectError(error.DuplicateDefinition, compile(std.testing.allocator, "type a = i8; type a = i32;"));
+    try std.testing.expectError(error.UnknownType, compile(std.testing.allocator, "type a = whatever;"));
+}
+
+test "static error: method collisions and unknown methods" {
+    try std.testing.expectError(error.DuplicateDefinition, compile(std.testing.allocator, "use str; add(str) fn len():i64 { return 0; }"));
+    try std.testing.expectError(error.DuplicateDefinition, compile(std.testing.allocator, "add(i64) fn f():i64 { return 0; } add(i64) fn f():i64 { return 0; }"));
+    try std.testing.expectError(error.UnknownField, compile(std.testing.allocator, "let x = 1; print(x.missing());"));
 }
 
 test "runtime error: string bounds" {
     const cases = [_][]const u8{
-        "print(\"abc\"[5]);",
-        "print(\"abc\"[0 - 1]);",
-        "let s = \"abc\"; print(s[2..1]);",
-        "print(\"abc\"[1..9]);",
+        "use str; print(\"abc\"[5]);",
+        "use str; print(\"abc\"[0 - 1]);",
+        "use str; let s = \"abc\"; print(s[2..1]);",
+        "use str; print(\"abc\"[1..9]);",
     };
     for (cases) |src| {
         const allocator = std.testing.allocator;

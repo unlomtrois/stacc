@@ -86,9 +86,12 @@ const RegionPlan = struct {
         return -8 * (@as(i64, self.used_regs) + rank + 1);
     }
 
-    /// hidden scratch quad for %rsp save/realign around C helper calls
+    /// hidden scratch quad for %rsp save/realign around C helper calls.
+    /// Register sharing means used_regs + mem_count can be less than
+    /// num_slots, so the offset is computed from the actual frame
+    /// extent (saved registers + memory slots), not the slot count.
     fn scratchOffset(self: *const RegionPlan) i64 {
-        return -8 * (@as(i64, self.num_slots) + 1);
+        return -8 * (@as(i64, self.used_regs) + self.mem_count + 1);
     }
 
     /// bytes to subtract in the prologue: memory slots + scratch
@@ -570,7 +573,11 @@ const Emitter = struct {
                 self.region = self.plan.regions.getPtr(index).?;
                 self.fn_end = self.program[index - 1].jump;
                 self.depth = 0;
-                try w.print("stacc_fn_{s}:\n", .{f.name});
+                if (f.owner.len > 0) {
+                    try w.print("stacc_fn_{s}.{s}:\n", .{ f.owner, f.name });
+                } else {
+                    try w.print("stacc_fn_{s}:\n", .{f.name});
+                }
                 try self.emitPrologue(self.region, f.num_params);
             },
             .push_const => |v| {
@@ -928,13 +935,16 @@ const Emitter = struct {
                         @as(u8, if (swapped) 1 else 0),
                     });
                     if (fused_target) |target| {
-                        try w.print("    {s} .L{d}\n", .{ switch (inst) {
-                            .eq => "jne",
-                            .ne => "je",
-                            .gt, .lt => "jbe", // lt uses swapped operands
-                            .ge, .le => "jb",
-                            else => unreachable,
-                        }, target });
+                        try w.print("    {s} .L{d}\n", .{
+                            switch (inst) {
+                                .eq => "jne",
+                                .ne => "je",
+                                .gt, .lt => "jbe", // lt uses swapped operands
+                                .ge, .le => "jb",
+                                else => unreachable,
+                            },
+                            target,
+                        });
                         return true;
                     }
                     try w.print("    {s} %al\n", .{switch (inst) {
@@ -1012,7 +1022,11 @@ const Emitter = struct {
             },
             .call => |c| {
                 if (reg_mode) try self.flush();
-                try w.print("    call stacc_fn_{s}\n", .{c.name});
+                if (c.owner.len > 0) {
+                    try w.print("    call stacc_fn_{s}.{s}\n", .{ c.owner, c.name });
+                } else {
+                    try w.print("    call stacc_fn_{s}\n", .{c.name});
+                }
                 if (c.num_params > 0) {
                     try w.print("    addq ${d}, %rsp\n", .{8 * @as(i64, c.num_params)});
                 }
@@ -1460,6 +1474,7 @@ test "strings lower to rodata labels, bounds checks and helpers" {
     var aw = std.Io.Writer.Allocating.init(allocator);
     defer aw.deinit();
     const asm_text = try emitToText(allocator,
+        \\use str;
         \\let s = "hi";
         \\print(s[0..1]);
         \\print(s == "hi");

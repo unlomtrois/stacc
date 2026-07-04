@@ -17,6 +17,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
+**Modules** (`src/modules/`): optional language features enabled by `use name;` (top-level, declare-before-use). A `Module` (`module.zig`) owns a slice of the language surface — a gated type name, literal forms, intrinsic methods; the registry is `registry.zig`. `str` is the first module (`str.zig`): without `use str;`, string literals and the `str` type name are `error.ModuleNotEnabled` (unknown modules: `error.UnknownModule`). The backend (bytecode instructions, VM handlers, native lowerings, C runtime helpers) stays in the backend; modules only gate the front door. **Methods**: `add(type) fn name(params):ret { ... }` attaches a method with an implicit `self` (receiver is the first parameter — which is free on a stack machine: the receiver is already on the stack in first-argument position). `expr.name(args)` calls it; receivers are exact-typed (no coercion); intrinsic methods (like `str.len()`) win over user methods and collide as `DuplicateDefinition`. `add` stays a valid function name: the method form is recognized contextually via the token pattern `add ( type ) fn` with a small LIFO pushback buffer. `type name = existing;` declares an alias. Methods/fns are labeled `stacc_fn_<owner>.<name>` natively (Call/FnPrologue carry an `owner` field).
+
 There are two coexisting implementations:
 
 1. **Old VM** (`src/vm/`) — the original legacy path, kept for reference. `tokenizer.zig` produces value/op tokens from postfix (RPN) input; `executor.zig` evaluates them on an `f64` stack. No longer wired to the CLI. Integration tests live in `src/vm/vm.zig`.

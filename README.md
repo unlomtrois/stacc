@@ -44,10 +44,17 @@ fn add(a:i64, b:i64):i64 { # declare before use; recursion works
 }
 print(add(y, add(1, 2)));  # calls nest in expressions
 
+use str;                   # text is a module, not a built-in
 let s = "hello, stacy";    # str: a two-slot fat value (ptr, len), no allocation
 print(s[7..12]);           # bounds-checked view, no copy
-print(s.len);
+print(s.len());            # intrinsic method
 print(s[7..12] == "stacy");
+
+add(str) fn head():i64 {   # attach methods to any type; `self` is implicit
+    return self[0];
+}
+print(s.head());           # method call: the receiver is already on the
+                           # stack in first-argument position, so this is free
 ```
 
 Compound values follow the same principle as everything else: the type stack holds one entry (`str`), the value stack holds its two slots. Construction, `.len` and slicing are type-stack events plus a few register ops; a str variable's pointer and length get register-allocated independently.

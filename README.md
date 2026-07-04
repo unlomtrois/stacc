@@ -85,7 +85,20 @@ zig build run -- --native examples/fib.stacy -o fib   # compile to a native exec
 ./fib
 ```
 
-`--native` lowers the bytecode to x86-64 assembly (`fib.s`, readable) and assembles/links it with `zig cc`, so no extra toolchain is needed. The typed instructions map directly: `i64.add` becomes an `addq`, `i8.store x@0` a `popq -8(%rbp)` after a range check, `call fact` a real `call` with a real stack frame. Recursive `fib(30)` runs about 100x faster than the interpreter.
+`--native` lowers the bytecode to x86-64 assembly (`fib.s`, readable) and assembles/links it with `zig cc`, so no extra toolchain is needed. The typed instructions map directly: `i64.add` becomes an `addq`, `call fact` a real `call` with a real stack frame. Recursive `fib(30)` runs about 200x faster than the interpreter.
+
+The backend does register allocation without ever building an interference graph, in two linear passes. A prescan over the flat bytecode computes each variable's live interval (first to last access, clamped to enclosing loop brackets: anything touched inside a loop is live for the whole loop, so liveness is bracket matching rather than dataflow). Because Stacy declares before use and its control flow is structured, those intervals form an interval graph whose perfect elimination order is declaration order, so greedy assignment to the callee-saved registers is an optimal coloring; when more than five variables overlap, the interval ending furthest is demoted to memory (Belady's rule applied to whole intervals). Expression temporaries need no analysis at all: the shunting yard's stack discipline means virtual stack depth is itself an optimal coloring, so depth indexes a fixed pool of caller-saved registers, with a per-frame fallback to hardware-stack mode for expressions deeper than the pool. Comparisons fuse with the branch that consumes them. The result for a typical counting loop is a body with zero memory accesses:
+
+```asm
+.L5:
+    movq %rbx, %rsi          # i
+    movabsq $100000000, %rdi
+    cmpq %rdi, %rsi
+    jge .L22                 # fused i < N
+    ...
+    movq %rsi, %r12          # acc
+    jmp .L5
+```
 
 Runnable programs live in `examples/`. (`main.stacy` is an old design sketch, not valid syntax.)
 
